@@ -92,21 +92,78 @@ This is the normalised best outcome - the fraction of the true optimum recovered
 
 ## 6. Ground truth specification for the simulator
 
+### 6a. Empirical derivation of the BO advantage (updated)
+
+The `+0.15` placeholder has been replaced with an empirically grounded value derived from
+direct simulation on four Olympus benchmark datasets [3, 5]. We ran GP-BO (Matérn-5/2 kernel,
+Expected Improvement acquisition) and random search for 20 independent seeds each, budget=100,
+n_init=5, on the raw experimental lookup tables downloaded from the Olympus GitHub repository [2].
+
+**Results at budget = 50 evaluations (mean over 20 seeds):**
+
+| Dataset | Difficulty | Dim | RS norm_best | BO norm_best | BO advantage (Δ) |
+|---|---|---|---|---|---|
+| HPLC | easy | 6 | 0.783 | 0.889 | **+0.106** |
+| SnAr | easy | 4 | 1.000 | 1.000 | +0.000 |
+| Suzuki | hard | 4 | 0.942 | 1.000 | **+0.058** |
+| Fullerenes | hard | 3 | 0.992 | 1.000 | +0.008 |
+
+**Key findings:**
+
+1. **The BO advantage is strongly landscape-dependent.** On HPLC (6D, rugged, large dataset),
+   BO outperforms random search by +0.11 at n=50. On SnAr (4D, smooth, only 66 points),
+   both strategies saturate near the optimum within 20 evaluations — the landscape is too
+   easy for BO to show an advantage.
+
+2. **The "hard" classification in the Olympus paper refers to random search difficulty, not
+   BO difficulty.** Suzuki is hard for random search (RS=0.94 at n=50) but trivial for BO
+   (BO=1.00 at n=10), giving a large apparent gap (+0.24 at n=10). Fullerenes is easy for
+   both (both near 1.0 throughout).
+
+3. **The HPLC dataset is the most informative for UC1.** It is the primary pharmaceutical
+   anchor dataset, has the highest dimensionality (6D), and shows a sustained, non-trivial
+   BO advantage across the full budget range (+0.08 to +0.11).
+
+4. **Across all datasets and budgets, the BO advantage ranges from 0.00 to +0.24.**
+   The median advantage at n=50 across the four datasets is approximately **+0.04**.
+   For the HPLC dataset specifically, the advantage at n=50 is **+0.11**.
+
+**Revised ground truth for the simulator:**
+
+The simulator will encode a strategy effect of **+0.10** (normalised best outcome units),
+representing the BO advantage on a moderately difficult, 4–6 dimensional landscape at a
+budget of ~50 evaluations. This is grounded in the HPLC result (+0.11) and is conservative
+relative to the Suzuki result (+0.06–+0.24 depending on budget). The value is intentionally
+set slightly below the HPLC empirical estimate to account for the fact that our simulator
+uses a GP lookup table emulator rather than the Olympus BNN emulator, which introduces
+additional noise.
+
+The simulator will also encode **landscape dependent heterogeneity**: the strategy effect
+will be modulated by `landscape_smoothness` (smooth landscapes → smaller BO advantage,
+consistent with the SnAr result) and `dimensionality` (higher dimensions → larger BO
+advantage, consistent with HPLC > SnAr/Suzuki/Fullerenes).
+
+**Benchmark figure**: `uc1_bo_vs_random_benchmark.png` (saved to results/).
+
+---
+
 The simulator will encode the following known causal effects, which DoWhy must recover:
 
-| Effect | Value | Justification |
+| Effect | Value | Empirical basis |
 |---|---|---|
-| `strategy → norm_best_outcome` | **+0.15** | BO recovers 15 percentage points more of the optimum than random search, all else equal |
-| `landscape_smoothness → norm_best_outcome` | +0.20 | Smoother landscapes are easier to optimise |
-| `budget → norm_best_outcome` | +0.10 per unit | More experiments always helps |
+| `strategy → norm_best_outcome` | **+0.10** | HPLC: +0.11 at n=50; Suzuki: +0.06 at n=50; median across datasets: +0.04 |
+| `landscape_smoothness → norm_best_outcome` | +0.20 | Smoother landscapes are easier to optimise (SnAr near-optimal throughout) |
+| `budget → norm_best_outcome` | +0.10 per unit | More experiments always helps (monotone improvement in all traces) |
 | `noise_level → norm_best_outcome` | -0.15 | Higher noise degrades surrogate model quality |
-| `dimensionality → norm_best_outcome` | -0.08 per unit | Curse of dimensionality |
+| `dimensionality → norm_best_outcome` | -0.08 per unit | Curse of dimensionality (HPLC 6D hardest) |
 | `landscape_smoothness → P(strategy=BO)` | +0.25 | Practitioners prefer BO on smooth landscapes |
 | `budget → P(strategy=BO)` | +0.15 | BO is worth the overhead for larger budgets |
 | `noise_level → P(strategy=BO)` | -0.20 | Practitioners avoid BO in high-noise settings |
 | `dimensionality → P(strategy=BO)` | -0.10 | Standard BO degrades in high dimensions |
 
-The naive (unadjusted) estimate of the strategy effect will be inflated above +0.15 because BO is preferentially used on easier problems (smoother, lower noise, lower dimensional). DoWhy's backdoor adjustment should recover +0.15.
+The naive (unadjusted) estimate of the strategy effect will be inflated above +0.10 because
+BO is preferentially used on easier problems (smoother, lower noise, lower dimensional).
+DoWhy's backdoor adjustment should recover +0.10.
 
 ---
 
@@ -114,7 +171,9 @@ The naive (unadjusted) estimate of the strategy effect will be inflated above +0
 
 After completing this use case, the design rule extracted will take the form:
 
-> "The naive performance advantage of BO over random search across our campaign library is approximately +X (normalised best outcome). After adjusting for landscape smoothness, budget, noise level, and dimensionality, the true causal effect is +0.15. The gap between naive and adjusted estimates reflects practitioner selection bias - BO is preferentially applied to easier problems. **Design rule**: when benchmarking strategies across campaigns, always condition on landscape properties and budget before attributing performance differences to strategy choice. Failure to do so will overestimate the benefit of BO by approximately X - 0.15 units."
+> "The naive performance advantage of BO over random search across our campaign library is approximately +X (normalised best outcome). After adjusting for landscape smoothness, budget, noise level, and dimensionality, the true causal effect is +0.10. The gap between naive and adjusted estimates reflects practitioner selection bias - BO is preferentially applied to easier problems. **Design rule**: when benchmarking strategies across campaigns, always condition on landscape properties and budget before attributing performance differences to strategy choice. Failure to do so will overestimate the benefit of BO by approximately X - 0.10 units."
+>
+> A secondary design rule concerns when BO is worth deploying at all: empirically, the BO advantage is near zero on low dimensional (≤3D), smooth, or data sparse landscapes (SnAr: +0.00; Fullerenes: +0.01), and largest on higher dimensional (6D), rugged landscapes with dense lookup tables (HPLC: +0.11). The adaptive planner should therefore gate BO deployment on estimated landscape dimensionality and smoothness, not apply it uniformly.
 
 ---
 
