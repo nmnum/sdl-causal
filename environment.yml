@@ -1,0 +1,79 @@
+name: sdl-causal
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # System-level graphviz required for pygraphviz (DAG visualisation)
+  # Install before pip packages: apt-get install -y graphviz graphviz-dev
+  # or on macOS: brew install graphviz
+
+  - pip:
+    # ── Causal inference ──────────────────────────────────────────────────────
+    # DoWhy 0.13 is the minimum version compatible with networkx 3.x.
+    # Versions <=0.12 call nx.algorithms.d_separated which was removed in
+    # networkx 3.x, causing an AttributeError at identify_effect().
+    - dowhy==0.13
+
+    # EconML provides CATE estimators used in DoWhy's estimate_effect()
+    # and is the backend for use cases 9 (heterogeneous treatment effects).
+    - econml==0.15.1
+
+    # ── Graph backends ────────────────────────────────────────────────────────
+    # networkx: core graph library used by DoWhy for DAG representation.
+    # 3.x required for is_d_separator API used by DoWhy 0.13.
+    - networkx>=3.3,<4.0
+
+    # pygraphviz: used by DoWhy for DAG visualisation (requires system graphviz).
+    # pydot: fallback graph renderer if pygraphviz is unavailable.
+    - pygraphviz>=1.11
+    - pydot>=1.4
+
+    # ── Scientific stack ──────────────────────────────────────────────────────
+    # numpy <2.0: many packages (olympus BNN emulators, older scipy) still
+    # have binary incompatibilities with numpy 2.x as of 2025-03.
+    - numpy>=1.24,<2.0
+
+    # pandas <3.0: olympus and several econml internals use deprecated
+    # pandas 2.x APIs that break on pandas 3.x.
+    - pandas>=1.5,<3.0
+
+    # scikit-learn <1.6: econml 0.15.x pins against sklearn API that changed
+    # in 1.6 (Pipeline and cross_val_score signature changes).
+    - scikit-learn>=1.3,<1.6
+
+    - scipy>=1.10
+    - statsmodels>=0.14
+
+    # ── Visualisation ─────────────────────────────────────────────────────────
+    - matplotlib>=3.7
+    - seaborn>=0.12
+
+    # ── SDL benchmark landscape library ───────────────────────────────────────
+    # Olympus: 33 experimentally-derived benchmark surfaces from chemistry
+    # and materials science. Installed from GitHub (PyPI version 0.4 is stale).
+    # Provides emulators (BNN surrogates) and 23 optimisation planners.
+    - olympus @ git+https://github.com/aspuru-guzik-group/olympus.git
+
+    # ── Notebook environment ──────────────────────────────────────────────────
+    - jupyter>=1.0
+    - ipykernel>=6.0
+
+    # ── Utilities ─────────────────────────────────────────────────────────────
+    - tqdm>=4.0
+    - joblib>=1.2
+
+# ── Compatibility notes ───────────────────────────────────────────────────────
+# Verified 2026-03-26 on Python 3.11, Linux x86_64.
+# Key incompatibilities resolved:
+#   - DoWhy <=0.12 + networkx >=3.0 → AttributeError on nx.algorithms.d_separated
+#     Fix: use dowhy==0.13 which imports from networkx.algorithms.d_separation
+#   - numpy >=2.0 breaks olympus BNN emulator binary extensions
+#     Fix: pin numpy<2.0
+#   - econml 0.15.x + scikit-learn >=1.6 → API breakage in Pipeline internals
+#     Fix: pin scikit-learn<1.6
+#   - pygraphviz requires system graphviz headers (graphviz-dev on Debian/Ubuntu)
+#     Fix: documented above; pydot is a pure-Python fallback
