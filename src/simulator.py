@@ -1,5 +1,5 @@
 """
-simulator.py — UC1 campaign simulator for the Self Driving Lab project.
+simulator.py — UC1 campaign simulator for the Self-Driving Lab project.
 
 Public API
 ----------
@@ -18,24 +18,28 @@ The data-generating process faithfully encodes the UC1 DAG from graphs.py:
      They are NOT drawn from arbitrary uniform distributions.
 
   2. Strategy assignment is a logistic function of the confounders, so BO
-     is preferentially assigned to easier problems - exactly the selection
+     is preferentially assigned to easier problems — exactly the selection
      bias that DoWhy's backdoor adjustment must correct.
 
   3. norm_best_outcome is a linear combination of the causal effects encoded
      in the graph edge weights, plus a batch random intercept and residual
-     noise. The strategy coefficient (+0.10) is the ground truth ATE that
+     noise.  The strategy coefficient (+0.10) is the ground truth ATE that
      DoWhy must recover.
 
   4. initial_design_quality is drawn independently of strategy (it is a
-     non-confounder by simulation design - see uc1_dag_reasoning.md §2).
+     non-confounder by simulation design — see uc1_dag_reasoning.md §2).
 
   5. batch_id is a categorical noise variable.  Its effect is a random
      intercept drawn from N(0, batch_sigma) per batch.
 
 Empirical basis for distribution parameters
 --------------------------------------------
-Confounder distributions are fitted to GP length scales and noise levels
-estimated from the four Olympus datasets:
+Confounder distributions are anchored to GP length-scales and noise levels
+estimated from the four Olympus datasets (one scalar per dataset — 4 anchor
+points total).  LogNormal parameters are moment-matched to these 4 values;
+they are NOT statistically fitted distributions in the usual sense.  The
+distributions are consistent with the empirical anchors but should be
+treated as plausible simulation priors, not validated population models.
 
     Dataset      dim   length_scale   noise_std
     HPLC           6         0.3095      0.1634
@@ -44,8 +48,11 @@ estimated from the four Olympus datasets:
     Fullerenes     3         0.6247      0.0678
 
     landscape_smoothness ~ LogNormal(mu=-0.4191, sigma=0.4819)
+      [anchored to 4 values; sigma driven largely by HPLC vs. Suzuki spread]
     noise_level          ~ LogNormal(mu=-2.5944, sigma=0.9931)
+      [wide sigma reflects SnAr outlier (0.015) vs. experimental datasets (0.16-0.18)]
     dimensionality       ~ Categorical({3: 0.25, 4: 0.50, 6: 0.25})
+      [empirical PMF of the 4 datasets]
 
 Reference: uc1_dag_reasoning.md §6a, uc1_bo_vs_random_benchmark.png
 """
@@ -71,7 +78,13 @@ from src.graphs import uc1_dag, get_adjustment_set, UC1_NODE_META
 UC1_COLUMNS: list[str] = [
     "campaign_id",            # int, unique campaign identifier
     "strategy",               # int, 0=random search, 1=BO
-    "norm_best_outcome",      # float in [0, 1], best found / true optimum
+    "norm_best_outcome",      # float in [0, 1], best found / true optimum (clipped)
+    "latent_outcome",         # float, norm_best_outcome BEFORE clipping to [0,1]
+                              #   Use this column for causal estimation (DoWhy).
+                              #   norm_best_outcome is for reporting only.
+                              #   Clipping disproportionately censors BO campaigns
+                              #   (72% of clipped rows are BO vs 50% overall),
+                              #   causing downward bias in the linear estimator.
     "landscape_smoothness",   # float > 0, GP length-scale proxy
     "budget",                 # int, number of evaluations allowed
     "noise_level",            # float >= 0, measurement noise std
@@ -84,9 +97,12 @@ UC1_COLUMNS: list[str] = [
 ]
 
 
-# ── Confounder distribution parameters (fitted to Olympus datasets) ───────────
-# These are module level constants so they can be inspected and overridden
+# ── Confounder distribution parameters (anchored to Olympus datasets) ────────
+# Moment-matched to 4 scalar anchor points (one per Olympus dataset).
+# These are module-level constants so they can be inspected and overridden
 # in tests without re-running the GP fits.
+# WARNING: LogNormal parameters are derived from only 4 data points.
+# Treat as simulation priors, not statistically validated distributions.
 
 # landscape_smoothness ~ LogNormal(LS_MU, LS_SIGMA)
 LS_MU:    float = -0.4191
@@ -136,6 +152,21 @@ def _read_edge_weights(G) -> dict[str, float]:
                 "only batch_id → norm_best_outcome may be None."
             )
         weights[f"{u}__{v}"] = float(w)
+
+    # ── Ground truth ATE guard ────────────────────────────────────────────────
+    # The strategy → norm_best_outcome weight is the documented ground truth
+    # ATE (+0.10).  If someone changes it in graphs.py without updating this
+    # guard, the simulator will raise immediately rather than silently
+    # generating data with the wrong ground truth.
+    _ate = weights["strategy__norm_best_outcome"]
+    if abs(_ate - 0.10) > 1e-9:
+        raise ValueError(
+            f"graphs.py strategy → norm_best_outcome weight is {_ate:+.4f}, "
+            f"expected +0.10 (the UC1 ground truth ATE). "
+            f"If you intentionally changed the ATE, update this guard in "
+            f"_read_edge_weights() and the UC1 design rule documentation."
+        )
+
     return weights
 
 
@@ -146,6 +177,7 @@ def run_campaigns(
     batch_sigma: float = 0.05,
     outcome_noise_sigma: float = 0.03,
     seed: Optional[int] = None,
+    return_curves: bool = False,
 ) -> pd.DataFrame:
     """
     Generate a synthetic campaign dataset encoding the UC1 causal DAG.
@@ -177,27 +209,32 @@ def run_campaigns(
     seed : int or None
         Random seed for reproducibility.
 
+    return_curves : bool
+        If True, raise NotImplementedError.  Reserved for UC3 (time-varying
+        strategy switches), which requires step-by-step BO replay.
+        UC1 only needs the end-of-campaign summary.
+
     Returns
     -------
     pd.DataFrame
-        One row per campaign. Columns defined in UC1_COLUMNS.
+        One row per campaign.  Columns defined in UC1_COLUMNS.
         norm_best_outcome is clipped to [0, 1] after generation.
 
     Notes
     -----
     The data-generating process is:
 
-        # Step 1 - draw confounders
+        # Step 1 — draw confounders
         landscape_smoothness ~ LogNormal(LS_MU, LS_SIGMA)
         noise_level          ~ LogNormal(NL_MU, NL_SIGMA)
         dimensionality       ~ Categorical(DIM_VALUES, DIM_PROBS)
         budget               ~ Uniform(low, high)  [or fixed]
 
-        # Step 2 - draw non-confounder and noise variable
+        # Step 2 — draw non-confounder and noise variable
         initial_design_quality ~ Beta(IDQ_ALPHA, IDQ_BETA)
         batch_id               ~ Categorical(0..n_batches-1)
 
-        # Step 3 - strategy assignment (logistic selection model)
+        # Step 3 — strategy assignment (logistic selection model)
         # Confounders are standardised before entering the logit so that
         # the log-odds coefficients from graphs.py are on a common scale.
         logit_p = intercept
@@ -208,7 +245,7 @@ def run_campaigns(
         p_bo    = sigmoid(logit_p)
         strategy ~ Bernoulli(p_bo)
 
-        # Step 4 - outcome (linear structural equation)
+        # Step 4 — outcome (linear structural equation)
         # Confounders and treatment are standardised before entering so
         # that the edge weights from graphs.py are effect sizes on the
         # normalised outcome scale.
@@ -228,6 +265,13 @@ def run_campaigns(
     The intercepts are chosen so that E[norm_best_outcome] ≈ 0.65 and
     E[p_bo] ≈ 0.50, matching the rough empirical base rates.
     """
+    if return_curves:
+        raise NotImplementedError(
+            "return_curves=True is reserved for UC3 (time-varying strategy "
+            "switches). UC1 uses end-of-campaign summary only. Implement "
+            "step-by-step BO replay in UC3 before enabling this."
+        )
+
     rng = np.random.default_rng(seed)
 
     # ── Load DAG and read edge weights ────────────────────────────────────────
@@ -249,15 +293,15 @@ def run_campaigns(
     idq = rng.beta(IDQ_ALPHA, IDQ_BETA, n_campaigns)           # initial_design_quality
     batch_ids = rng.integers(0, n_batches, size=n_campaigns)   # batch_id
 
-    # Batch random intercepts - 1 per batch, shared across campaigns in
+    # Batch random intercepts — one per batch, shared across campaigns in
     # the same batch.  This is the random effect for batch_id → outcome.
     batch_effects = rng.normal(0.0, batch_sigma, size=n_batches)
     batch_intercept = batch_effects[batch_ids]
 
     # ── Standardise continuous confounders ────────────────────────────────────
     # Edge weights in graphs.py are calibrated on a standardised scale so
-    # that a 1 unit change corresponds to 1 standard deviation of the
-    # confounder. Standardise using the sample mean/std of this draw.
+    # that a one-unit change corresponds to one standard deviation of the
+    # confounder.  Standardise using the sample mean/std of this draw.
     def _std(x: np.ndarray) -> np.ndarray:
         s = x.std()
         return (x - x.mean()) / s if s > 1e-12 else np.zeros_like(x)
@@ -286,7 +330,7 @@ def run_campaigns(
     # with strategy=0 (random search baseline).
     intercept_outcome = 0.65
 
-    norm_best = (
+    latent_outcome = (
         intercept_outcome
         + w["strategy__norm_best_outcome"]               * strategy
         + w["landscape_smoothness__norm_best_outcome"]   * ls_z
@@ -297,13 +341,33 @@ def run_campaigns(
         + batch_intercept
         + rng.normal(0.0, outcome_noise_sigma, n_campaigns)
     )
-    norm_best = np.clip(norm_best, 0.0, 1.0)
+    # norm_best_outcome is the clipped version for reporting.
+    # latent_outcome is the pre-clip value for causal estimation.
+    #
+    # Why latent_outcome is needed for DoWhy:
+    #   Ceiling clipping (norm_best ≥ 1.0) disproportionately censors BO
+    #   campaigns (~72% of clipped rows are BO vs 50% overall), because BO
+    #   is preferentially assigned to easier problems that are more likely to
+    #   hit the ceiling.  This introduces a Tobit-style censoring bias that
+    #   causes OLS on norm_best_outcome to underestimate the ATE.
+    #
+    #   A secondary contributor is non-collapsibility: the selection model is
+    #   logistic (non-linear) while the outcome model is linear, and the
+    #   confounders are non-Gaussian (LogNormal).  In finite samples this can
+    #   cause OLS to incompletely adjust even on unclipped data.  However,
+    #   the 50-seed sweep (uc1_seed_sweep.csv) confirms that OLS on
+    #   latent_outcome is unbiased in expectation (mean error = +0.0002,
+    #   p=0.82 vs H0: error=0), so non-collapsibility is not a material
+    #   problem at n=2000 for this DGP.  The ceiling-clipping censoring is
+    #   the dominant and actionable issue.
+    norm_best = np.clip(latent_outcome, 0.0, 1.0)
 
     # ── Assemble DataFrame ────────────────────────────────────────────────────
     df = pd.DataFrame({
         "campaign_id":            np.arange(n_campaigns),
         "strategy":               strategy.astype(int),
         "norm_best_outcome":      norm_best,
+        "latent_outcome":         latent_outcome,
         "landscape_smoothness":   ls,
         "budget":                 bud.astype(int),
         "noise_level":            nl,
@@ -341,10 +405,10 @@ if __name__ == "__main__":
     mean_outcome = df["norm_best_outcome"].mean()
     print(f"Mean norm_best_outcome:      {mean_outcome:.3f}  (target ≈ 0.65)")
 
-    # Naive ATE (unadjusted) — should be inflated above +0.10
-    naive_ate = (df.loc[df.strategy==1, "norm_best_outcome"].mean()
-               - df.loc[df.strategy==0, "norm_best_outcome"].mean())
-    print(f"Naive ATE (unadjusted):      {naive_ate:+.4f}  (should be > +0.10)")
+    # Naive ATE on latent_outcome (pre-clip) — should be inflated above +0.10
+    naive_ate = (df.loc[df.strategy==1, "latent_outcome"].mean()
+               - df.loc[df.strategy==0, "latent_outcome"].mean())
+    print(f"Naive ATE on latent_outcome: {naive_ate:+.4f}  (should be > +0.10)")
     print(f"True ATE (graph weight):     +0.1000")
     print(f"Confounding bias:            {naive_ate - 0.10:+.4f}  (should be > 0)")
 

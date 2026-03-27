@@ -1,5 +1,5 @@
 """
-graphs.py — Causal DAG definitions for the SDL project.
+graphs.py — Causal DAG definitions for the Self-Driving Lab project.
 
 This file is the single source of truth for causal structure.
 Notebooks and the simulator import from here; they never redefine graphs inline.
@@ -17,11 +17,12 @@ Empirical basis for effect sizes: uc1_bo_vs_random_benchmark.png
 from __future__ import annotations
 
 from typing import Callable
+
 import networkx as nx
 
 
 # ── Node metadata ─────────────────────────────────────────────────────────────
-# Stored as a module level dict so the simulator can read variable roles
+# Stored as a module-level dict so the simulator can read variable roles
 # without re-parsing the graph.
 
 UC1_NODE_META: dict[str, dict] = {
@@ -30,7 +31,7 @@ UC1_NODE_META: dict[str, dict] = {
         "dtype": "continuous",
         "description": (
             "Estimated smoothness of the objective surface "
-            "(e.g. GP length scale). Higher = smoother."
+            "(e.g. GP length-scale). Higher = smoother."
         ),
     },
     "budget": {
@@ -52,10 +53,10 @@ UC1_NODE_META: dict[str, dict] = {
         "role": "non_confounder",
         "dtype": "continuous",
         "description": (
-            "Space filling score of the seed points. "
+            "Space-filling score of the seed points. "
             "Affects outcome but NOT strategy choice in simulation "
             "(assigned independently of strategy). "
-            "Would be a confounder in real SDL data - revisit on translation."
+            "Would be a confounder in real SDL data — revisit on translation."
         ),
     },
     "batch_id": {
@@ -64,7 +65,7 @@ UC1_NODE_META: dict[str, dict] = {
         "description": (
             "Experimental batch identifier (reagent lot, instrument day). "
             "Affects outcome via reagent variability. "
-            "Not known at strategy selection time → not a confounder."
+            "Not known at strategy-selection time → not a confounder."
         ),
     },
     "strategy": {
@@ -77,7 +78,7 @@ UC1_NODE_META: dict[str, dict] = {
         "dtype": "continuous",
         "description": (
             "Best outcome found / true optimum. "
-            "Scale free; 1.0 = optimum recovered exactly."
+            "Scale-free; 1.0 = optimum recovered exactly."
         ),
     },
 }
@@ -105,16 +106,16 @@ def uc1_dag() -> nx.DiGraph:
     four Olympus benchmark datasets (HPLC 6D, SnAr 4D, Suzuki 4D,
     Fullerenes 3D), 20 seeds each, budget=100.
 
-    Outcome effects are in normalised best outcome units (0-1 scale).
-    Strategy selection effects are in log-odds units (logistic model).
+    Outcome effects are in normalised best outcome units (0–1 scale).
+    Strategy-selection effects are in log-odds units (logistic model).
 
     Returns
     -------
     nx.DiGraph
         Nodes carry UC1_NODE_META attributes.
         Edges carry:
-          weight   : float  - effect size (see above)
-          rationale: str    - one sentence causal justification
+          weight   : float  — effect size (see above)
+          rationale: str    — one-sentence causal justification
     """
     G = nx.DiGraph(name="UC1_strategy_vs_outcome")
 
@@ -179,8 +180,8 @@ def uc1_dag() -> nx.DiGraph:
         weight=+0.10,
         rationale=(
             "BO recovers ~10 percentage points more of the true optimum than "
-            "random search on a moderately difficult 4-6D landscape at budget "
-            "~50. Effect is landscape dependent: near zero on smooth/sparse "
+            "random search on a moderately difficult 4–6D landscape at budget "
+            "~50. Effect is landscape-dependent: near-zero on smooth/sparse "
             "landscapes (SnAr +0.00), up to +0.11 on rugged/dense ones "
             "(HPLC 6D). This is the average treatment effect (ATE) that "
             "DoWhy's backdoor adjustment must recover."
@@ -243,10 +244,10 @@ def uc1_dag() -> nx.DiGraph:
         "initial_design_quality", "norm_best_outcome",
         weight=+0.12,
         rationale=(
-            "A well spread initial design (high space filling score) gives both "
+            "A well-spread initial design (high space-filling score) gives both "
             "strategies a better starting point, improving the best outcome "
             "found. In simulation this is assigned independently of strategy, "
-            "so it is not a confounder - but it is a real cause of outcome "
+            "so it is not a confounder — but it is a real cause of outcome "
             "variance and must be in the graph."
         ),
     )
@@ -280,7 +281,7 @@ def get_confounders(G: nx.DiGraph, treatment: str, outcome: str) -> list[str]:
     This is the minimal sufficient adjustment set for a DAG with no
     unobserved variables and no selection bias.
 
-    Note: this is a graph level convenience, not a substitute for
+    Note: this is a graph-level convenience, not a substitute for
     DoWhy's identify_effect(), which handles more complex structures.
     """
     parents_of_treatment = set(G.predecessors(treatment))
@@ -290,14 +291,16 @@ def get_confounders(G: nx.DiGraph, treatment: str, outcome: str) -> list[str]:
 
 def get_adjustment_set(G: nx.DiGraph | None = None) -> list[str]:
     """
-    Return the UC1 backdoor adjustment set.
+    Return the UC1 backdoor adjustment set, sorted alphabetically.
     Hardcoded for clarity; must match get_confounders(uc1_dag(), ...).
+    Sorted so that equality comparisons with get_confounders() (which also
+    returns a sorted list) are order-independent without requiring callers
+    to sort.
     """
-    return ["landscape_smoothness", "budget", "noise_level", "dimensionality"]
-
+    return sorted(['landscape_smoothness', 'budget', 'noise_level', 'dimensionality'])
 
 def summarise(G: nx.DiGraph) -> None:
-    """Print a human readable summary of nodes, roles, and edges."""
+    """Print a human-readable summary of nodes, roles, and edges."""
     print(f"Graph: {G.graph.get('name', 'unnamed')}")
     print(f"  Nodes ({G.number_of_nodes()}):")
     for n, d in G.nodes(data=True):
@@ -326,8 +329,8 @@ if __name__ == "__main__":
     adj = get_confounders(G, treatment="strategy", outcome="norm_best_outcome")
     print(f"\nBackdoor adjustment set (graph-derived): {adj}")
     print(f"Hardcoded adjustment set:                {get_adjustment_set()}")
-    assert adj == sorted(get_adjustment_set()), (
-        "Graph derived and hardcoded adjustment sets disagree — "
+    assert adj == get_adjustment_set(), (
+        "Graph-derived and hardcoded adjustment sets disagree — "
         "update get_adjustment_set() to match the graph."
     )
     print("\nAssertion passed: adjustment sets agree.")
