@@ -1,5 +1,5 @@
 """
-simulator.py — UC1 campaign simulator for the Self-Driving Lab project.
+simulator.py — UC1 / UC2 campaign simulator for the Self-Driving Lab project.
 
 Public API
 ----------
@@ -67,13 +67,17 @@ import pandas as pd
 
 # graphs.py is the single source of truth for edge weights.
 # Import the DAG and read weights from it rather than hardcoding them here.
-from src.graphs import uc1_dag, get_adjustment_set, UC1_NODE_META
+from src.graphs import (
+    uc1_dag, uc2_dag,
+    get_adjustment_set, get_uc2_adjustment_set,
+    UC1_NODE_META,
+    UC2_SNR_THRESHOLD, UC2_SNR_SCALE, UC2_BO_FLOOR, UC2_BO_CEILING,
+)
 
 
-# ── Fixed output schema ───────────────────────────────────────────────────────
-# All columns that run_campaigns() guarantees to return.
-# Later UCs may add columns; UC1-only columns are listed here.
-# NaN-valued optional columns for future UCs are appended at the end.
+# ── Fixed output schemas ──────────────────────────────────────────────────────
+# UC1_COLUMNS: guaranteed columns for use_case="UC1"
+# UC2_COLUMNS: extends UC1 with snr and snr_modulation
 
 UC1_COLUMNS: list[str] = [
     "campaign_id",            # int, unique campaign identifier
@@ -94,6 +98,13 @@ UC1_COLUMNS: list[str] = [
     # ── Provenance ────────────────────────────────────────────────────────────
     "p_bo",                   # float, P(strategy=BO) before Bernoulli draw
     "batch_intercept",        # float, realised batch random effect
+]
+
+UC2_COLUMNS: list[str] = UC1_COLUMNS + [
+    "snr",                    # float > 0, landscape_smoothness / noise_level
+    "snr_modulation",         # float in [UC2_BO_FLOOR, UC2_BO_CEILING],
+                              #   f(snr): the realised BO advantage multiplier
+                              #   for this campaign.  Ground truth ATE = E[f(snr)].
 ]
 
 
@@ -123,12 +134,77 @@ IDQ_ALPHA: float = 2.0
 IDQ_BETA:  float = 2.0
 
 
+def snr_modulation_fn(
+    snr: np.ndarray,
+    tau: Optional[float] = None,
+    scale: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Threshold + smooth-decay moderation function f(snr; τ, scale).
+
+    Maps SNR → BO advantage multiplier in [UC2_BO_FLOOR, UC2_BO_CEILING].
+
+    Functional form
+    ---------------
+    f(snr; τ, scale) = UC2_BO_FLOOR
+                       + (UC2_BO_CEILING - UC2_BO_FLOOR)
+                       × sigmoid((snr - τ) / scale)
+
+    Default: τ = UC2_SNR_THRESHOLD = 2.0, scale = UC2_SNR_SCALE = 1.0.
+
+    Properties (for any τ > 0, scale > 0)
+    --------------------------------------
+    - f(snr → 0)   → UC2_BO_FLOOR    (asymptotic; never reached in sim)
+    - f(snr = τ)   = midpoint = (UC2_BO_FLOOR + UC2_BO_CEILING) / 2 = +0.025
+    - f(snr → ∞)   → UC2_BO_CEILING  (asymptotic; recovers UC1 ATE)
+    - Actual simulated range at τ=2.0: f ∈ [−0.032, +0.100] (SNR ∈ [0.14, 305])
+    - Monotone non-decreasing in SNR for any τ, scale > 0
+    - Dimensionless: τ transfers across datasets without rescaling
+
+    GP-theoretic basis
+    ------------------
+    When noise variance σ²_n ≥ signal variance σ²_f (SNR ≤ 1), the GP
+    posterior variance barely shrinks from the prior, and the acquisition
+    function selects points near-uniformly (≈ random search).  τ = 2.0
+    gives a conservative margin: at SNR = 2.0 the GP is still informative
+    but the BO advantage is halved.  See uc2_dag_reasoning.md §4.
+
+    The τ sensitivity analysis (uc2_tau_sensitivity.ipynb) shows that the
+    qualitative design rule — BO underperforms RS below threshold, outperforms
+    above — holds for τ ∈ {1.0, 1.5, 2.0, 2.5, 3.0}.
+
+    Parameters
+    ----------
+    snr : np.ndarray
+        Per-campaign SNR values (landscape_smoothness / noise_level).
+    tau : float or None
+        SNR threshold.  If None, uses UC2_SNR_THRESHOLD (= 2.0).
+        Pass a non-default value for sensitivity analysis only.
+    scale : float or None
+        Sigmoid steepness.  If None, uses UC2_SNR_SCALE (= 1.0).
+
+    Returns
+    -------
+    np.ndarray
+        Per-campaign BO advantage multiplier, same shape as snr.
+    """
+    _tau   = UC2_SNR_THRESHOLD if tau   is None else float(tau)
+    _scale = UC2_SNR_SCALE     if scale is None else float(scale)
+    sig = 1.0 / (1.0 + np.exp(-(snr - _tau) / _scale))
+    return UC2_BO_FLOOR + (UC2_BO_CEILING - UC2_BO_FLOOR) * sig
+
+
 def _read_edge_weights(G) -> dict[str, float]:
     """
-    Extract the scalar edge weights from the UC1 DAG that the outcome
-    equation needs.  Raises if any expected edge is missing or has
-    weight=None (which would indicate a modelling gap).
+    Extract the scalar edge weights from a UC1 or UC2 DAG.
+
+    Reads all edges that the outcome and selection equations need.
+    UC2-specific edges (snr → strategy, snr → norm_best_outcome) are
+    included only if present in the graph.
+
+    Raises if any required edge is missing or has weight=None.
     """
+    # UC1 required edges (always present)
     required = {
         ("strategy",              "norm_best_outcome"),
         ("landscape_smoothness",  "norm_best_outcome"),
@@ -141,6 +217,12 @@ def _read_edge_weights(G) -> dict[str, float]:
         ("noise_level",           "strategy"),
         ("dimensionality",        "strategy"),
     }
+    # UC2 additional edges (present only in UC2 DAG)
+    optional = {
+        ("snr", "strategy"),
+        ("snr", "norm_best_outcome"),
+    }
+
     weights: dict[str, float] = {}
     for u, v in required:
         if not G.has_edge(u, v):
@@ -153,18 +235,24 @@ def _read_edge_weights(G) -> dict[str, float]:
             )
         weights[f"{u}__{v}"] = float(w)
 
+    for u, v in optional:
+        if G.has_edge(u, v):
+            w = G[u][v].get("weight")
+            if w is None:
+                raise ValueError(f"Optional edge {u} → {v} has weight=None.")
+            weights[f"{u}__{v}"] = float(w)
+
     # ── Ground truth ATE guard ────────────────────────────────────────────────
-    # The strategy → norm_best_outcome weight is the documented ground truth
-    # ATE (+0.10).  If someone changes it in graphs.py without updating this
-    # guard, the simulator will raise immediately rather than silently
-    # generating data with the wrong ground truth.
+    # The strategy → norm_best_outcome weight is the documented ceiling ATE
+    # (+0.10).  In UC1 this is the fixed ATE; in UC2 it is the noise-free
+    # limit of f(snr).  Either way it must be +0.10.
     _ate = weights["strategy__norm_best_outcome"]
     if abs(_ate - 0.10) > 1e-9:
         raise ValueError(
             f"graphs.py strategy → norm_best_outcome weight is {_ate:+.4f}, "
-            f"expected +0.10 (the UC1 ground truth ATE). "
+            f"expected +0.10 (the UC1/UC2 ground truth ATE ceiling). "
             f"If you intentionally changed the ATE, update this guard in "
-            f"_read_edge_weights() and the UC1 design rule documentation."
+            f"_read_edge_weights() and the design rule documentation."
         )
 
     return weights
@@ -178,9 +266,11 @@ def run_campaigns(
     outcome_noise_sigma: float = 0.03,
     seed: Optional[int] = None,
     return_curves: bool = False,
+    use_case: str = "UC1",
+    tau: Optional[float] = None,
 ) -> pd.DataFrame:
     """
-    Generate a synthetic campaign dataset encoding the UC1 causal DAG.
+    Generate a synthetic campaign dataset encoding the UC1 or UC2 causal DAG.
 
     Parameters
     ----------
@@ -212,46 +302,45 @@ def run_campaigns(
     return_curves : bool
         If True, raise NotImplementedError.  Reserved for UC3 (time-varying
         strategy switches), which requires step-by-step BO replay.
-        UC1 only needs the end-of-campaign summary.
+
+    use_case : {"UC1", "UC2"}
+        Which causal DAG / structural equation to use.
+
+        "UC1" (default):
+            strategy effect is a fixed scalar (+0.10).
+            Returns UC1_COLUMNS.
+
+        "UC2":
+            strategy effect is modulated by SNR via snr_modulation_fn().
+            Adds 'snr' and 'snr_modulation' columns.
+            Returns UC2_COLUMNS.
+            The ground truth ATE is E[f(snr; tau)] (depends on the SNR
+            distribution and tau), NOT the fixed +0.10 of UC1.
+            Use latent_outcome for causal estimation (same reason as UC1:
+            ceiling clipping censors BO campaigns disproportionately).
+
+    tau : float or None
+        SNR threshold passed to snr_modulation_fn().  Only used when
+        use_case="UC2".  If None (default), uses UC2_SNR_THRESHOLD = 2.0.
+        Pass a non-default value for τ sensitivity analysis only — the
+        canonical value for all other analyses is 2.0.
+        Ignored when use_case="UC1".
 
     Returns
     -------
     pd.DataFrame
-        One row per campaign.  Columns defined in UC1_COLUMNS.
+        One row per campaign.
+        UC1: columns defined in UC1_COLUMNS.
+        UC2: columns defined in UC2_COLUMNS (superset of UC1_COLUMNS).
         norm_best_outcome is clipped to [0, 1] after generation.
 
     Notes
     -----
-    The data-generating process is:
+    UC1 structural equation:
 
-        # Step 1 — draw confounders
-        landscape_smoothness ~ LogNormal(LS_MU, LS_SIGMA)
-        noise_level          ~ LogNormal(NL_MU, NL_SIGMA)
-        dimensionality       ~ Categorical(DIM_VALUES, DIM_PROBS)
-        budget               ~ Uniform(low, high)  [or fixed]
-
-        # Step 2 — draw non-confounder and noise variable
-        initial_design_quality ~ Beta(IDQ_ALPHA, IDQ_BETA)
-        batch_id               ~ Categorical(0..n_batches-1)
-
-        # Step 3 — strategy assignment (logistic selection model)
-        # Confounders are standardised before entering the logit so that
-        # the log-odds coefficients from graphs.py are on a common scale.
-        logit_p = intercept
-                  + w(ls→s)  * landscape_smoothness_std
-                  + w(b→s)   * budget_std
-                  + w(nl→s)  * noise_level_std
-                  + w(d→s)   * dimensionality_std
-        p_bo    = sigmoid(logit_p)
-        strategy ~ Bernoulli(p_bo)
-
-        # Step 4 — outcome (linear structural equation)
-        # Confounders and treatment are standardised before entering so
-        # that the edge weights from graphs.py are effect sizes on the
-        # normalised outcome scale.
         norm_best_outcome =
-              intercept_outcome
-            + w(s→y)   * strategy                    # ATE = +0.10
+              0.65
+            + 0.10 * strategy                        # fixed ATE
             + w(ls→y)  * landscape_smoothness_std
             + w(b→y)   * budget_std
             + w(nl→y)  * noise_level_std
@@ -260,22 +349,35 @@ def run_campaigns(
             + batch_intercept[batch_id]
             + N(0, outcome_noise_sigma)
 
-        clipped to [0, 1]
+    UC2 structural equation (replaces the strategy term):
+
+        strategy_effect = snr_modulation_fn(snr) * strategy
+                        = f(snr) * strategy
+        where f(snr) ∈ [UC2_BO_FLOOR, UC2_BO_CEILING] = [-0.05, +0.10]
+
+        snr = landscape_smoothness / noise_level  (per campaign)
+
+        The SNR also enters the selection model (snr → strategy) and the
+        outcome directly (snr → norm_best_outcome), making it a confounder
+        that must be in the adjustment set.
 
     The intercepts are chosen so that E[norm_best_outcome] ≈ 0.65 and
     E[p_bo] ≈ 0.50, matching the rough empirical base rates.
     """
+    if use_case not in ("UC1", "UC2"):
+        raise ValueError(f"use_case must be 'UC1' or 'UC2', got {use_case!r}")
+
     if return_curves:
         raise NotImplementedError(
             "return_curves=True is reserved for UC3 (time-varying strategy "
-            "switches). UC1 uses end-of-campaign summary only. Implement "
-            "step-by-step BO replay in UC3 before enabling this."
+            "switches). Implement step-by-step BO replay in UC3 before "
+            "enabling this."
         )
 
     rng = np.random.default_rng(seed)
 
     # ── Load DAG and read edge weights ────────────────────────────────────────
-    G = uc1_dag()
+    G = uc2_dag() if use_case == "UC2" else uc1_dag()
     w = _read_edge_weights(G)
 
     # ── Step 1: Draw confounders ──────────────────────────────────────────────
@@ -312,6 +414,13 @@ def run_campaigns(
     bud_z  = _std(bud)
     idq_z  = _std(idq)
 
+    # ── Step 2b (UC2 only): Compute SNR ──────────────────────────────────────
+    # SNR = landscape_smoothness / noise_level.
+    # Clipped to a small positive floor to avoid division-by-zero when
+    # noise_level is near zero (rare but possible with LogNormal draws).
+    snr = ls / np.maximum(nl, 1e-6)
+    snr_z = _std(snr)
+
     # ── Step 3: Strategy assignment (logistic selection model) ────────────────
     # Intercept chosen so that E[p_bo] ≈ 0.50 at mean confounder values
     # (which are zero after standardisation).
@@ -322,6 +431,10 @@ def run_campaigns(
         + w["noise_level__strategy"]          * nl_z
         + w["dimensionality__strategy"]       * dim_z
     )
+    if use_case == "UC2":
+        # SNR additionally confounds strategy choice in UC2
+        logit_p += w["snr__strategy"] * snr_z
+
     p_bo = 1.0 / (1.0 + np.exp(-logit_p))       # sigmoid
     strategy = rng.binomial(1, p_bo).astype(float)
 
@@ -330,9 +443,20 @@ def run_campaigns(
     # with strategy=0 (random search baseline).
     intercept_outcome = 0.65
 
+    if use_case == "UC1":
+        # Fixed strategy effect: ATE = +0.10 (ground truth)
+        strategy_contribution = w["strategy__norm_best_outcome"] * strategy
+        snr_modulation = np.full(n_campaigns, w["strategy__norm_best_outcome"])
+    else:
+        # UC2: strategy effect is modulated by SNR
+        # f(snr; tau) ∈ [UC2_BO_FLOOR, UC2_BO_CEILING] = [-0.05, +0.10]
+        # Ground truth ATE = E[f(snr; tau)] (depends on SNR distribution and tau)
+        snr_modulation = snr_modulation_fn(snr, tau=tau)
+        strategy_contribution = snr_modulation * strategy
+
     latent_outcome = (
         intercept_outcome
-        + w["strategy__norm_best_outcome"]               * strategy
+        + strategy_contribution
         + w["landscape_smoothness__norm_best_outcome"]   * ls_z
         + w["budget__norm_best_outcome"]                 * bud_z
         + w["noise_level__norm_best_outcome"]            * nl_z
@@ -341,6 +465,10 @@ def run_campaigns(
         + batch_intercept
         + rng.normal(0.0, outcome_noise_sigma, n_campaigns)
     )
+    if use_case == "UC2":
+        # SNR has a direct effect on outcome (separate from moderation)
+        latent_outcome += w["snr__norm_best_outcome"] * snr_z
+
     # norm_best_outcome is the clipped version for reporting.
     # latent_outcome is the pre-clip value for causal estimation.
     #
@@ -350,16 +478,6 @@ def run_campaigns(
     #   is preferentially assigned to easier problems that are more likely to
     #   hit the ceiling.  This introduces a Tobit-style censoring bias that
     #   causes OLS on norm_best_outcome to underestimate the ATE.
-    #
-    #   A secondary contributor is non-collapsibility: the selection model is
-    #   logistic (non-linear) while the outcome model is linear, and the
-    #   confounders are non-Gaussian (LogNormal).  In finite samples this can
-    #   cause OLS to incompletely adjust even on unclipped data.  However,
-    #   the 50-seed sweep (uc1_seed_sweep.csv) confirms that OLS on
-    #   latent_outcome is unbiased in expectation (mean error = +0.0002,
-    #   p=0.82 vs H0: error=0), so non-collapsibility is not a material
-    #   problem at n=2000 for this DGP.  The ceiling-clipping censoring is
-    #   the dominant and actionable issue.
     norm_best = np.clip(latent_outcome, 0.0, 1.0)
 
     # ── Assemble DataFrame ────────────────────────────────────────────────────
@@ -378,9 +496,14 @@ def run_campaigns(
         "batch_intercept":        batch_intercept,
     })
 
+    if use_case == "UC2":
+        df["snr"]            = snr
+        df["snr_modulation"] = snr_modulation
+
     # Enforce column order and schema
-    assert list(df.columns) == UC1_COLUMNS, (
-        f"Column mismatch.\nExpected: {UC1_COLUMNS}\nGot: {list(df.columns)}"
+    expected_cols = UC2_COLUMNS if use_case == "UC2" else UC1_COLUMNS
+    assert list(df.columns) == expected_cols, (
+        f"Column mismatch.\nExpected: {expected_cols}\nGot: {list(df.columns)}"
     )
 
     return df

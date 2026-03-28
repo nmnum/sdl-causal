@@ -9,7 +9,10 @@ fresh copy (networkx graphs are mutable).  Edge metadata is stored in the
 edge attribute dict and mirrored in inline comments so the reasoning is
 visible without running the code.
 
-Reference document: uc1_dag_reasoning.md
+Reference documents:
+  uc1_dag_reasoning.md  — UC1 causal structure and empirical basis
+  uc2_dag_reasoning.md  — UC2 noise moderation, SNR threshold, GP-theoretic τ
+
 Empirical basis for effect sizes: uc1_bo_vs_random_benchmark.png
   (160 campaigns, GP-BO vs. random search, 4 Olympus datasets, 20 seeds each)
 """
@@ -297,7 +300,8 @@ def get_adjustment_set(G: nx.DiGraph | None = None) -> list[str]:
     returns a sorted list) are order-independent without requiring callers
     to sort.
     """
-    return sorted(['landscape_smoothness', 'budget', 'noise_level', 'dimensionality'])
+    return sorted(["landscape_smoothness", "budget", "noise_level", "dimensionality"])
+
 
 def summarise(G: nx.DiGraph) -> None:
     """Print a human-readable summary of nodes, roles, and edges."""
@@ -313,24 +317,259 @@ def summarise(G: nx.DiGraph) -> None:
         print(f"    {u:30s} → {v:25s}  weight={w_str}")
 
 
+# ── UC2: Noise-moderated strategy effect ──────────────────────────────────────
+
+# UC2 adds one new node (snr) and one moderation edge (strategy × snr → outcome).
+# The SNR threshold τ is stored here as a module-level constant so the simulator
+# and tests can import it without re-parsing the graph.
+#
+# GP-theoretic justification for τ = 2.0
+# ----------------------------------------
+# In a GP surrogate, the posterior variance at a point x is:
+#
+#   σ²_post(x) = k(x,x) - k(x,X)[K(X,X) + σ²_n I]⁻¹ k(X,x)
+#
+# When σ²_n (noise variance) ≥ σ²_f (signal variance), the noise term
+# dominates the kernel matrix inversion, and the posterior variance barely
+# shrinks from the prior.  The acquisition function (e.g. EI) then selects
+# points almost uniformly — indistinguishable from random search.
+#
+# The crossover point is SNR = σ²_f / σ²_n = 1.0 (noise = signal).
+# We set τ = 2.0 (noise = 50% of signal) to give a conservative margin:
+# at SNR = 2.0 the GP is still informative but the BO advantage is halved
+# relative to the noise-free case.  This is consistent with the Olympus
+# benchmarks: SnAr (SNR ≈ 3200, smooth) shows BO advantage ≈ 0; HPLC
+# (SNR ≈ 23, rugged) shows BO advantage ≈ +0.11.
+#
+# τ is dimensionless (ratio of variances) and therefore transfers across
+# campaign datasets without rescaling.  To apply to new data, estimate
+# SNR = Var(signal) / Var(noise) from replicate measurements.
+
+UC2_SNR_THRESHOLD: float = 2.0   # τ: SNR at which BO advantage = midpoint
+UC2_SNR_SCALE:     float = 1.0   # sigmoid steepness around τ (in SNR units)
+UC2_BO_FLOOR:      float = -0.05 # ASYMPTOTIC floor of f(snr) as snr → 0
+                                  # NOTE: this is the sigmoid parameter, NOT the
+                                  # value of f at any reachable SNR.  Because
+                                  # noise_level ~ LogNormal (always > 0), snr
+                                  # never reaches 0 in simulation.  The actual
+                                  # minimum of f(snr) over the simulated SNR
+                                  # distribution is ≈ −0.032 (at the 1st
+                                  # percentile of SNR ≈ 0.14).
+UC2_BO_CEILING:    float = +0.10 # ASYMPTOTIC ceiling of f(snr) as snr → ∞
+                                  # (= UC1 ATE, noise-free limit).  In practice
+                                  # f saturates to within 1e-4 of this by SNR≈20.
+
+UC2_NODE_META: dict[str, dict] = {
+    **UC1_NODE_META,  # inherit all UC1 nodes
+    "snr": {
+        "role": "confounder",
+        "dtype": "continuous",
+        "description": (
+            "Signal-to-noise ratio: landscape_smoothness / noise_level. "
+            "Dimensionless; transfers across campaign datasets. "
+            "Confounds strategy choice (practitioners avoid BO at low SNR) "
+            "and directly moderates the BO advantage (GP surrogate degrades "
+            "when noise dominates signal). "
+            f"Threshold τ = {UC2_SNR_THRESHOLD:.1f}: below this, BO advantage "
+            "collapses to zero or slightly negative."
+        ),
+    },
+}
+
+
+def uc2_dag() -> nx.DiGraph:
+    """
+    Return the UC2 causal DAG as a networkx.DiGraph.
+
+    Scientific question
+    -------------------
+    Does measurement noise moderate the causal effect of strategy choice on
+    campaign outcome?  Specifically: is the BO advantage over random search
+    smaller (or negative) at low signal-to-noise ratios, and does it recover
+    above a critical SNR threshold?
+
+    New elements relative to UC1
+    ----------------------------
+    Node  : snr = landscape_smoothness / noise_level
+              Role: confounder (affects both strategy choice and outcome)
+              Derived from existing UC1 variables; not independently drawn.
+
+    Edges :
+      snr → strategy          (confounding: practitioners avoid BO at low SNR)
+      snr → norm_best_outcome (direct: high SNR → easier optimisation)
+      strategy × snr → norm_best_outcome  (moderation: BO advantage depends on SNR)
+
+    The moderation edge is encoded in the structural equation as:
+        strategy_effect = f(snr) * strategy
+    where f(snr) is the threshold+smooth-decay function (see UC2_SNR_THRESHOLD).
+
+    Moderation function f(snr)
+    --------------------------
+    f(snr) = UC2_BO_FLOOR + (UC2_BO_CEILING - UC2_BO_FLOOR)
+             × sigmoid((snr - τ) / scale)
+
+    Properties:
+      - f(snr → 0)   → UC2_BO_FLOOR  = -0.05  (asymptotic; never reached in sim)
+      - f(snr = τ)   = midpoint       = +0.025 (half the maximum advantage)
+      - f(snr → ∞)   → UC2_BO_CEILING = +0.10  (asymptotic; recovers UC1 ATE)
+      - Monotone non-decreasing in SNR (strictly increasing on [0.1, 20])
+      - Dimensionless τ transfers across datasets
+      - Actual simulated range: f ∈ [−0.032, +0.100] (SNR ∈ [0.14, 305])
+
+    Identification
+    --------------
+    The causal effect of strategy on norm_best_outcome is identified by
+    backdoor adjustment on {landscape_smoothness, budget, noise_level,
+    dimensionality, snr}.
+
+    Important notes on the adjustment set:
+    1. snr is a deterministic function of landscape_smoothness and noise_level
+       (both already in the UC1 adjustment set).  Conditioning on {ls, nl}
+       already blocks all snr backdoor paths — adding snr is over-specified
+       but makes the interaction term directly estimable.
+    2. The parent edges landscape_smoothness → snr and noise_level → snr
+       do NOT change the adjustment set: snr is not a descendant of strategy,
+       so the backdoor criterion is unaffected.  get_confounders() still
+       returns the same 5-element set.
+    3. In the OLS regression, include EITHER snr alone OR {ls, nl} — not
+       all three simultaneously, as snr = ls/nl creates near-perfect
+       multicollinearity.  The canonical estimator for the moderation story
+       uses snr as the sole SNR-related regressor.
+
+    Returns
+    -------
+    nx.DiGraph
+        Inherits all UC1 nodes and edges.
+        Adds: snr node, snr→strategy, snr→outcome edges.
+        The strategy→outcome edge weight is now a *function* of snr
+        (encoded in the simulator); the graph stores the ceiling weight
+        (+0.10) and the moderation parameters in node/edge metadata.
+    """
+    # Start from UC1 DAG and extend
+    G = uc1_dag()
+    G.graph["name"] = "UC2_noise_moderation"
+
+    # Update node metadata to UC2 version
+    for node, meta in UC2_NODE_META.items():
+        if node not in G.nodes:
+            G.add_node(node, **meta)
+        else:
+            G.nodes[node].update(meta)
+
+    # ── New node: snr ─────────────────────────────────────────────────────────
+    # snr = landscape_smoothness / noise_level (deterministic function).
+    # We add explicit parent edges landscape_smoothness → snr and
+    # noise_level → snr so that DoWhy's graph traversal correctly represents
+    # snr as a derived quantity rather than an exogenous confounder.
+    # Without these edges, DoWhy would treat snr as independent of its
+    # parents, which would misrepresent the causal structure and could
+    # cause incorrect identification in more complex queries.
+
+    G.add_edge(
+        "landscape_smoothness", "snr",
+        weight=+1.0,   # snr increases with landscape_smoothness (numerator)
+        rationale=(
+            "SNR = landscape_smoothness / noise_level. Landscape smoothness "
+            "is the numerator: higher smoothness → higher SNR."
+        ),
+    )
+    G.add_edge(
+        "noise_level", "snr",
+        weight=-1.0,   # snr decreases with noise_level (denominator)
+        rationale=(
+            "SNR = landscape_smoothness / noise_level. Noise level is the "
+            "denominator: higher noise → lower SNR."
+        ),
+    )
+
+    # ── snr → strategy (confounding) ─────────────────────────────────────────
+    G.add_edge(
+        "snr", "strategy",
+        weight=+0.30,
+        rationale=(
+            "Practitioners are more likely to choose BO when the SNR is high "
+            "(clean signal, reliable surrogate). At low SNR, the GP model is "
+            "unreliable and practitioners default to random search or Latin "
+            "hypercube designs. Effect is stronger than the individual "
+            "noise_level and landscape_smoothness effects because SNR captures "
+            "their interaction."
+        ),
+    )
+
+    # ── snr → norm_best_outcome (direct effect) ───────────────────────────────
+    G.add_edge(
+        "snr", "norm_best_outcome",
+        weight=+0.08,
+        rationale=(
+            "Higher SNR means the objective function is easier to resolve, "
+            "improving the best outcome found regardless of strategy. "
+            "This is a direct effect of SNR on optimisation difficulty, "
+            "separate from the moderation of the BO advantage."
+        ),
+    )
+
+    # ── Annotate the strategy → outcome edge with moderation metadata ─────────
+    # The edge weight (+0.10) is the ceiling (noise-free limit).
+    # The actual effect in the simulator is f(snr) * strategy, where f is
+    # the threshold+smooth-decay function.  We store the moderation parameters
+    # in the edge metadata so the simulator can read them from the graph.
+    G["strategy"]["norm_best_outcome"].update({
+        "moderated_by": "snr",
+        "moderation_fn": "threshold_sigmoid",
+        "snr_threshold": UC2_SNR_THRESHOLD,
+        "snr_scale":     UC2_SNR_SCALE,
+        "bo_floor":      UC2_BO_FLOOR,
+        "bo_ceiling":    UC2_BO_CEILING,
+        "weight_note": (
+            "weight=+0.10 is the noise-free ceiling (SNR→∞). "
+            "Actual effect = f(snr) ∈ [UC2_BO_FLOOR, UC2_BO_CEILING]. "
+            "See UC2_SNR_THRESHOLD and uc2_dag_reasoning.md §4."
+        ),
+    })
+
+    return G
+
+
+def get_uc2_adjustment_set() -> list[str]:
+    """
+    Return the UC2 backdoor adjustment set, sorted alphabetically.
+    Extends UC1 by adding 'snr'.
+    """
+    return sorted([
+        "landscape_smoothness", "budget", "noise_level", "dimensionality", "snr"
+    ])
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 # As more use cases are added, register their factory functions here.
 # The simulator and notebooks can look up graphs by UC name.
 
 GRAPH_REGISTRY: dict[str, Callable[[], nx.DiGraph]] = {
     "UC1": uc1_dag,
+    "UC2": uc2_dag,
 }
 
 
 if __name__ == "__main__":
-    G = uc1_dag()
-    summarise(G)
-
-    adj = get_confounders(G, treatment="strategy", outcome="norm_best_outcome")
-    print(f"\nBackdoor adjustment set (graph-derived): {adj}")
+    print("=== UC1 ===")
+    G1 = uc1_dag()
+    summarise(G1)
+    adj1 = get_confounders(G1, treatment="strategy", outcome="norm_best_outcome")
+    print(f"\nBackdoor adjustment set (graph-derived): {adj1}")
     print(f"Hardcoded adjustment set:                {get_adjustment_set()}")
-    assert adj == get_adjustment_set(), (
+    assert adj1 == get_adjustment_set(), (
         "Graph-derived and hardcoded adjustment sets disagree — "
         "update get_adjustment_set() to match the graph."
     )
-    print("\nAssertion passed: adjustment sets agree.")
+    print("Assertion passed: UC1 adjustment sets agree.")
+
+    print("\n=== UC2 ===")
+    G2 = uc2_dag()
+    summarise(G2)
+    adj2 = get_confounders(G2, treatment="strategy", outcome="norm_best_outcome")
+    print(f"\nBackdoor adjustment set (graph-derived): {adj2}")
+    print(f"Hardcoded adjustment set:                {get_uc2_adjustment_set()}")
+    assert adj2 == get_uc2_adjustment_set(), (
+        "Graph-derived and hardcoded UC2 adjustment sets disagree."
+    )
+    print("Assertion passed: UC2 adjustment sets agree.")

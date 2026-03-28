@@ -1,6 +1,6 @@
 # Use Case 1: Causal Effect of Strategy Choice on Campaign Outcome
 
-**Status**: Reasoning complete, awaiting implementation  
+**Status**: Reasoning complete, implementation done
 **DoWhy feature**: Backdoor adjustment (linear regression, propensity score matching)  
 **Unit of analysis**: Campaign (one row = one complete experimental campaign)
 
