@@ -550,6 +550,213 @@ GRAPH_REGISTRY: dict[str, Callable[[], nx.DiGraph]] = {
 }
 
 
+# ── UC3: Convergence Curves (time-varying strategy effect) ────────────────────
+#
+# Scientific question
+# -------------------
+# Does BO converge faster than random search, and at what point in a campaign
+# does the BO advantage emerge?  UC3 extends UC2 to a (campaign, step) panel,
+# making the strategy effect time-varying via a warmup sigmoid.
+#
+# New elements relative to UC2
+# ----------------------------
+# Node  : step — within-campaign evaluation index (1..budget)
+#           Role: time index (NOT a confounder — strategy is fixed at campaign
+#           start and does not depend on step).
+#
+# Structural equation (per step t within campaign c):
+#
+#   norm_best_outcome_t = baseline(t)
+#                       + f(snr_c) × g(t; t_warmup_c) × strategy_c
+#                       + [UC2 confounder terms]
+#                       + ε_t
+#
+# where:
+#   baseline(t)  = intercept + UC3_ALPHA_RS × log(t + 1)
+#   g(t; t_w)    = sigmoid((t - t_w) / UC3_WARMUP_SCALE)
+#   t_warmup_c   = warmup_fraction_c × budget_c
+#   warmup_fraction_c = clip(
+#       UC3_WARMUP_BASE
+#       + UC3_WARMUP_W_DIM × dim_z_c
+#       - UC3_WARMUP_W_SNR × log_snr_z_c
+#       - UC3_WARMUP_W_IDQ × idq_z_c,
+#       0.05, 0.40
+#   )
+#
+# Identification
+# --------------
+# The adjustment set is the same as UC2: {budget, dimensionality,
+# landscape_smoothness, noise_level, snr}.  step is NOT in the adjustment
+# set — it is not a confounder.  It is included as a covariate in the
+# regression to control for the within-campaign time trend.
+#
+# Estimator: OLS with strategy × log(t) interaction + cluster-robust SEs
+# (clustered at campaign level to correct for within-campaign autocorrelation
+# from the monotone best-found trajectory).
+#
+# Empirical basis
+# ---------------
+# Parameters calibrated to the Olympus HPLC benchmark (6D, budget=100):
+#   - RS log-linear fit: Y(t) ≈ 0.40 + 0.10 × log(t+1)
+#   - BO starts outperforming RS at ~t=10 → warmup_fraction ≈ 0.10
+#   - Sigmoid steepness: BO advantage emerges over ~5 steps
+#
+# Reference: uc3_dag_reasoning.md
+
+# ── UC3 module-level constants ────────────────────────────────────────────────
+UC3_ALPHA_RS:      float = 0.10   # RS log-linear convergence rate
+                                   # calibrated: RS reaches 0.78 at t=50 from 0.55 at t=5
+UC3_WARMUP_BASE:   float = 0.10   # base warmup fraction at mean confounders
+                                   # calibrated: BO outperforms RS at ~t=10 (budget=100)
+UC3_WARMUP_SCALE:  float = 5.0    # sigmoid steepness (in steps)
+                                   # BO advantage emerges over ~5 steps
+UC3_WARMUP_W_DIM:  float = 0.03   # warmup increases with dimensionality
+UC3_WARMUP_W_SNR:  float = 0.02   # warmup decreases with log(SNR)
+UC3_WARMUP_W_IDQ:  float = 0.02   # warmup decreases with initial design quality
+UC3_STEP_NOISE:    float = 0.02   # per-step measurement noise std (within-campaign)
+
+UC3_NODE_META: dict[str, dict] = {
+    **UC2_NODE_META,  # inherit all UC2 nodes
+    "step": {
+        "role": "time_index",
+        "dtype": "discrete",
+        "description": (
+            "Within-campaign evaluation index (1 to budget). "
+            "Exogenous time index — NOT a confounder. Strategy is fixed at "
+            "campaign start and does not depend on step. step moderates the "
+            "strategy effect via the warmup sigmoid g(t; t_warmup)."
+        ),
+    },
+    "norm_best_outcome_t": {
+        "role": "outcome",
+        "dtype": "continuous",
+        "description": (
+            "Best outcome found up to step t (running maximum). "
+            "Monotone non-decreasing within a campaign. "
+            "Replaces norm_best_outcome as the outcome variable in UC3."
+        ),
+    },
+}
+
+
+def uc3_dag() -> nx.DiGraph:
+    """
+    Return the UC3 causal DAG as a networkx.DiGraph.
+
+    Scientific question
+    -------------------
+    Does BO converge faster than random search, and at what point in a
+    campaign does the BO advantage emerge?
+
+    New elements relative to UC2
+    ----------------------------
+    Node  : step — within-campaign evaluation index (1..budget)
+              Role: time index (exogenous; NOT a confounder)
+
+    Edges :
+      step → norm_best_outcome_t
+          Both strategies improve over time (log-linear baseline).
+      strategy × step → norm_best_outcome_t
+          The BO advantage grows with step via the warmup sigmoid g(t).
+          Encoded in the structural equation; stored as edge metadata.
+
+    The outcome node is renamed norm_best_outcome_t (step-level running max)
+    to distinguish it from the campaign-level norm_best_outcome in UC1/UC2.
+
+    Identification
+    --------------
+    Same adjustment set as UC2: {budget, dimensionality, landscape_smoothness,
+    noise_level, snr}.  step is NOT in the adjustment set.
+
+    Estimator: OLS with strategy × log(step) interaction + cluster-robust SEs
+    (clustered at campaign level).
+
+    Returns
+    -------
+    nx.DiGraph
+        Inherits all UC2 nodes and edges.
+        Adds: step node, step→norm_best_outcome_t edge.
+        Renames outcome node to norm_best_outcome_t.
+        Stores warmup parameters in strategy→outcome edge metadata.
+    """
+    # Start from UC2 DAG and extend
+    G = uc2_dag()
+    G.graph["name"] = "UC3_convergence_curves"
+
+    # Update node metadata to UC3 version
+    for node, meta in UC3_NODE_META.items():
+        if node not in G.nodes:
+            G.add_node(node, **meta)
+        else:
+            G.nodes[node].update(meta)
+
+    # ── Rename outcome node to norm_best_outcome_t ────────────────────────────
+    # UC3 uses a step-level outcome (running maximum up to step t).
+    # We add the new outcome node and redirect all edges from
+    # norm_best_outcome to norm_best_outcome_t.
+    # The original norm_best_outcome node is kept for backward compatibility
+    # (it represents the campaign-level final outcome, i.e. norm_best_outcome_t
+    # at t=budget).
+    G.add_node("norm_best_outcome_t", **UC3_NODE_META["norm_best_outcome_t"])
+
+    # Copy all edges into norm_best_outcome to norm_best_outcome_t
+    for pred in list(G.predecessors("norm_best_outcome")):
+        edge_data = dict(G[pred]["norm_best_outcome"])
+        G.add_edge(pred, "norm_best_outcome_t", **edge_data)
+
+    # ── New node: step ────────────────────────────────────────────────────────
+    # step is exogenous (no parents in the DAG).
+    # It is a time index, not a confounder.
+
+    # ── step → norm_best_outcome_t ────────────────────────────────────────────
+    G.add_edge(
+        "step", "norm_best_outcome_t",
+        weight=UC3_ALPHA_RS,
+        rationale=(
+            "Both strategies improve over time via log-linear convergence. "
+            f"Baseline rate UC3_ALPHA_RS = {UC3_ALPHA_RS:.2f} (log-scale), "
+            "calibrated to HPLC: RS reaches 0.78 at t=50 from 0.55 at t=5. "
+            "The BO additional advantage is encoded in the strategy×step "
+            "interaction (see edge metadata on strategy→norm_best_outcome_t)."
+        ),
+    )
+
+    # ── Annotate strategy → norm_best_outcome_t with warmup metadata ──────────
+    # The time-varying BO advantage is:
+    #   strategy_effect(t) = f(snr) × g(t; t_warmup) × strategy
+    # where g(t) = sigmoid((t - t_warmup) / UC3_WARMUP_SCALE).
+    # We store the warmup parameters in the edge metadata so the simulator
+    # can read them from the graph.
+    G["strategy"]["norm_best_outcome_t"].update({
+        "moderated_by":    "snr_and_step",
+        "moderation_fn":   "snr_sigmoid_times_warmup_sigmoid",
+        "warmup_base":     UC3_WARMUP_BASE,
+        "warmup_scale":    UC3_WARMUP_SCALE,
+        "warmup_w_dim":    UC3_WARMUP_W_DIM,
+        "warmup_w_snr":    UC3_WARMUP_W_SNR,
+        "warmup_w_idq":    UC3_WARMUP_W_IDQ,
+        "weight_note": (
+            "weight=+0.10 is the noise-free, end-of-campaign ceiling. "
+            "Actual effect at step t = f(snr) × g(t; t_warmup). "
+            "See UC3_WARMUP_* constants and uc3_dag_reasoning.md §4."
+        ),
+    })
+
+    return G
+
+
+def get_uc3_adjustment_set() -> list[str]:
+    """
+    Return the UC3 backdoor adjustment set, sorted alphabetically.
+    Identical to UC2: step is a time index, not a confounder.
+    """
+    return get_uc2_adjustment_set()
+
+
+# ── Update registry ───────────────────────────────────────────────────────────
+GRAPH_REGISTRY["UC3"] = uc3_dag
+
+
 if __name__ == "__main__":
     print("=== UC1 ===")
     G1 = uc1_dag()
@@ -573,3 +780,22 @@ if __name__ == "__main__":
         "Graph-derived and hardcoded UC2 adjustment sets disagree."
     )
     print("Assertion passed: UC2 adjustment sets agree.")
+
+    print("\n=== UC3 ===")
+    G3 = uc3_dag()
+    summarise(G3)
+    adj3 = get_confounders(G3, treatment="strategy", outcome="norm_best_outcome_t")
+    print(f"\nBackdoor adjustment set (graph-derived): {adj3}")
+    print(f"Hardcoded adjustment set:                {get_uc3_adjustment_set()}")
+    assert adj3 == get_uc3_adjustment_set(), (
+        "Graph-derived and hardcoded UC3 adjustment sets disagree."
+    )
+    print("Assertion passed: UC3 adjustment sets agree.")
+    print(f"\nUC3 warmup constants:")
+    print(f"  UC3_ALPHA_RS     = {UC3_ALPHA_RS}")
+    print(f"  UC3_WARMUP_BASE  = {UC3_WARMUP_BASE}")
+    print(f"  UC3_WARMUP_SCALE = {UC3_WARMUP_SCALE}")
+    print(f"  UC3_WARMUP_W_DIM = {UC3_WARMUP_W_DIM}")
+    print(f"  UC3_WARMUP_W_SNR = {UC3_WARMUP_W_SNR}")
+    print(f"  UC3_WARMUP_W_IDQ = {UC3_WARMUP_W_IDQ}")
+    print(f"  UC3_STEP_NOISE   = {UC3_STEP_NOISE}")

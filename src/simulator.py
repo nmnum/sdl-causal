@@ -68,10 +68,12 @@ import pandas as pd
 # graphs.py is the single source of truth for edge weights.
 # Import the DAG and read weights from it rather than hardcoding them here.
 from src.graphs import (
-    uc1_dag, uc2_dag,
-    get_adjustment_set, get_uc2_adjustment_set,
+    uc1_dag, uc2_dag, uc3_dag,
+    get_adjustment_set, get_uc2_adjustment_set, get_uc3_adjustment_set,
     UC1_NODE_META,
     UC2_SNR_THRESHOLD, UC2_SNR_SCALE, UC2_BO_FLOOR, UC2_BO_CEILING,
+    UC3_ALPHA_RS, UC3_WARMUP_BASE, UC3_WARMUP_SCALE,
+    UC3_WARMUP_W_DIM, UC3_WARMUP_W_SNR, UC3_WARMUP_W_IDQ, UC3_STEP_NOISE,
 )
 
 
@@ -105,6 +107,35 @@ UC2_COLUMNS: list[str] = UC1_COLUMNS + [
     "snr_modulation",         # float in [UC2_BO_FLOOR, UC2_BO_CEILING],
                               #   f(snr): the realised BO advantage multiplier
                               #   for this campaign.  Ground truth ATE = E[f(snr)].
+]
+
+# UC3_COLUMNS: one row per (campaign, step).
+# campaign_id + step jointly identify a row.
+# norm_best_outcome_t is the running maximum up to step t (monotone).
+# latent_outcome_t is the pre-clip value for causal estimation.
+UC3_COLUMNS: list[str] = [
+    "campaign_id",            # int, campaign identifier (repeated for each step)
+    "step",                   # int, within-campaign evaluation index (1..budget)
+    "strategy",               # int, 0=random search, 1=BO (constant within campaign)
+    "norm_best_outcome_t",    # float in [0, 1], best found up to step t (clipped)
+    "latent_outcome_t",       # float, norm_best_outcome_t BEFORE clipping
+                              #   Use for causal estimation (same reason as UC1/UC2).
+    "landscape_smoothness",   # float > 0, GP length-scale proxy
+    "budget",                 # int, total evaluations allowed in this campaign
+    "noise_level",            # float >= 0, measurement noise std
+    "dimensionality",         # int in {3, 4, 6}
+    "initial_design_quality", # float in [0, 1], space-filling score of seeds
+    "batch_id",               # int, batch identifier
+    "snr",                    # float > 0, landscape_smoothness / noise_level
+    "snr_modulation",         # float, f(snr): campaign-level BO advantage ceiling
+    "warmup_fraction",        # float in [0.05, 0.40], fraction of budget before
+                              #   BO advantage is at half-maximum
+    "t_warmup",               # float, warmup_fraction × budget (in steps)
+    "g_t",                    # float in [0, 1], warmup sigmoid g(step; t_warmup)
+                              #   Ground truth time-varying ATE = snr_modulation × g_t
+    # ── Provenance ────────────────────────────────────────────────────────────
+    "p_bo",                   # float, P(strategy=BO) before Bernoulli draw
+    "batch_intercept",        # float, realised batch random effect
 ]
 
 
@@ -365,13 +396,17 @@ def run_campaigns(
     E[p_bo] ≈ 0.50, matching the rough empirical base rates.
     """
     if use_case not in ("UC1", "UC2"):
-        raise ValueError(f"use_case must be 'UC1' or 'UC2', got {use_case!r}")
+        raise ValueError(
+            f"use_case must be 'UC1' or 'UC2', got {use_case!r}. "
+            "For UC3 (convergence curves / step-level panel), use "
+            "run_campaigns_uc3() instead."
+        )
 
     if return_curves:
         raise NotImplementedError(
-            "return_curves=True is reserved for UC3 (time-varying strategy "
-            "switches). Implement step-by-step BO replay in UC3 before "
-            "enabling this."
+            "return_curves=True is not supported in run_campaigns(). "
+            "For UC3 (convergence curves), use run_campaigns_uc3() to get "
+            "the step-level (campaign, step) panel."
         )
 
     rng = np.random.default_rng(seed)
@@ -504,6 +539,268 @@ def run_campaigns(
     expected_cols = UC2_COLUMNS if use_case == "UC2" else UC1_COLUMNS
     assert list(df.columns) == expected_cols, (
         f"Column mismatch.\nExpected: {expected_cols}\nGot: {list(df.columns)}"
+    )
+
+    return df
+
+
+def run_campaigns_uc3(
+    n_campaigns: int = 500,
+    budget: int | tuple[int, int] = (20, 100),
+    n_batches: int = 10,
+    batch_sigma: float = 0.05,
+    outcome_noise_sigma: float = 0.03,
+    seed: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Generate a synthetic (campaign, step) panel encoding the UC3 causal DAG.
+
+    UC3 extends UC2 to a step-level panel.  Each campaign contributes
+    `budget` rows (one per evaluation step).  The outcome is the running
+    maximum best-found value up to step t.
+
+    Parameters
+    ----------
+    n_campaigns : int
+        Number of campaigns to simulate.
+
+    budget : int or (int, int)
+        If int, every campaign has this budget.
+        If (low, high), budget is drawn uniformly from [low, high].
+
+    n_batches : int
+        Number of distinct experimental batches.
+
+    batch_sigma : float
+        Standard deviation of the batch random intercept.
+
+    outcome_noise_sigma : float
+        Per-step residual noise std (within-campaign).
+
+    seed : int or None
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (campaign, step).  Columns defined in UC3_COLUMNS.
+        norm_best_outcome_t is clipped to [0, 1].
+        latent_outcome_t is the pre-clip value for causal estimation.
+
+    Notes
+    -----
+    Structural equation (per step t within campaign c):
+
+        baseline(t) = 0.40 + UC3_ALPHA_RS × log(t + 1)
+
+        warmup_fraction_c = clip(
+            UC3_WARMUP_BASE
+            + UC3_WARMUP_W_DIM × dim_z_c
+            - UC3_WARMUP_W_SNR × log_snr_z_c
+            - UC3_WARMUP_W_IDQ × idq_z_c,
+            0.05, 0.40
+        )
+
+        t_warmup_c = warmup_fraction_c × budget_c
+
+        g(t; t_warmup_c) = sigmoid((t - t_warmup_c) / UC3_WARMUP_SCALE)
+
+        strategy_effect(t) = snr_modulation_c × g(t; t_warmup_c) × strategy_c
+
+        latent_outcome_t = baseline(t)
+                         + strategy_effect(t)
+                         + [UC2 confounder terms]
+                         + batch_intercept_c
+                         + N(0, outcome_noise_sigma)
+
+        norm_best_outcome_t = running_max(clip(latent_outcome_t, 0, 1))
+
+    The running maximum is taken over the clipped values to ensure
+    norm_best_outcome_t is monotone non-decreasing within each campaign.
+
+    Ground truth time-varying ATE at step t:
+        ATE_true(t) = E[snr_modulation × g(t; t_warmup)]
+    This is recoverable from the 'snr_modulation' and 'g_t' columns.
+
+    Consistency with UC1/UC2:
+        At t=budget, g(t) ≈ 1.0, so ATE(budget) ≈ E[snr_modulation] = UC2 ATE.
+        The UC1 ATE (+0.10) is the noise-free ceiling as SNR→∞ and t→∞.
+    """
+    rng = np.random.default_rng(seed)
+
+    # ── Load DAG (for documentation; warmup params imported directly) ─────────
+    _ = uc3_dag()  # validates graph structure; constants already imported
+
+    # ── Step 1: Draw campaign-level confounders ───────────────────────────────
+    ls  = rng.lognormal(LS_MU, LS_SIGMA, n_campaigns)
+    nl  = rng.lognormal(NL_MU, NL_SIGMA, n_campaigns)
+    dim = rng.choice(DIM_VALUES, size=n_campaigns, p=DIM_PROBS).astype(float)
+
+    if isinstance(budget, tuple):
+        low, high = budget
+        bud = rng.integers(low, high + 1, size=n_campaigns).astype(float)
+    else:
+        bud = np.full(n_campaigns, float(budget))
+
+    idq      = rng.beta(IDQ_ALPHA, IDQ_BETA, n_campaigns)
+    batch_ids = rng.integers(0, n_batches, size=n_campaigns)
+    batch_effects = rng.normal(0.0, batch_sigma, size=n_batches)
+    batch_intercept = batch_effects[batch_ids]
+
+    # ── Standardise campaign-level confounders ────────────────────────────────
+    def _std(x: np.ndarray) -> np.ndarray:
+        s = x.std()
+        return (x - x.mean()) / s if s > 1e-12 else np.zeros_like(x)
+
+    ls_z  = _std(ls)
+    nl_z  = _std(nl)
+    dim_z = _std(dim)
+    bud_z = _std(bud)
+    idq_z = _std(idq)
+
+    snr   = ls / np.maximum(nl, 1e-6)
+    # Use log(snr) for warmup fraction (log-scale SNR is more linear)
+    log_snr   = np.log(np.maximum(snr, 1e-6))
+    log_snr_z = _std(log_snr)
+    snr_z     = _std(snr)
+
+    # ── Step 2: Strategy assignment (same logistic model as UC2) ──────────────
+    # Read edge weights from UC2 DAG (UC3 inherits the same selection model)
+    G2 = uc2_dag()
+    w  = _read_edge_weights(G2)
+
+    logit_p = (
+        0.0
+        + w["landscape_smoothness__strategy"] * ls_z
+        + w["budget__strategy"]               * bud_z
+        + w["noise_level__strategy"]          * nl_z
+        + w["dimensionality__strategy"]       * dim_z
+        + w["snr__strategy"]                  * snr_z
+    )
+    p_bo     = 1.0 / (1.0 + np.exp(-logit_p))
+    strategy = rng.binomial(1, p_bo).astype(float)
+
+    # ── Step 3: Campaign-level SNR modulation (same as UC2) ───────────────────
+    snr_modulation = snr_modulation_fn(snr)   # f(snr) ∈ [UC2_BO_FLOOR, UC2_BO_CEILING]
+
+    # ── Step 4: Warmup fraction per campaign ──────────────────────────────────
+    warmup_fraction = np.clip(
+        UC3_WARMUP_BASE
+        + UC3_WARMUP_W_DIM * dim_z
+        - UC3_WARMUP_W_SNR * log_snr_z
+        - UC3_WARMUP_W_IDQ * idq_z,
+        0.05, 0.40,
+    )
+    t_warmup = warmup_fraction * bud   # in steps (float; compared to step index)
+
+    # ── Step 5: Expand to (campaign, step) panel ──────────────────────────────
+    # Build index arrays: for each campaign c, steps 1..budget_c
+    budgets_int = bud.astype(int)
+    total_rows  = budgets_int.sum()
+
+    # Pre-allocate arrays for the panel
+    camp_idx_arr  = np.empty(total_rows, dtype=int)
+    step_arr      = np.empty(total_rows, dtype=int)
+
+    pos = 0
+    for c, b in enumerate(budgets_int):
+        camp_idx_arr[pos:pos + b] = c
+        step_arr[pos:pos + b]     = np.arange(1, b + 1)
+        pos += b
+
+    # Broadcast campaign-level quantities to step level
+    ls_panel          = ls[camp_idx_arr]
+    nl_panel          = nl[camp_idx_arr]
+    dim_panel         = dim[camp_idx_arr]
+    bud_panel         = bud[camp_idx_arr]
+    idq_panel         = idq[camp_idx_arr]
+    batch_id_panel    = batch_ids[camp_idx_arr]
+    batch_int_panel   = batch_intercept[camp_idx_arr]
+    snr_panel         = snr[camp_idx_arr]
+    snr_mod_panel     = snr_modulation[camp_idx_arr]
+    strategy_panel    = strategy[camp_idx_arr]
+    p_bo_panel        = p_bo[camp_idx_arr]
+    t_warmup_panel    = t_warmup[camp_idx_arr]
+    wf_panel          = warmup_fraction[camp_idx_arr]
+
+    # Standardise confounder columns at the panel level
+    # (same values as campaign level, just repeated — std is identical)
+    ls_z_panel  = _std(ls_panel)
+    nl_z_panel  = _std(nl_panel)
+    dim_z_panel = _std(dim_panel)
+    bud_z_panel = _std(bud_panel)
+    idq_z_panel = _std(idq_panel)
+    snr_z_panel = _std(snr_panel)
+
+    # ── Step 6: Warmup sigmoid g(t; t_warmup) ────────────────────────────────
+    t = step_arr.astype(float)
+    g_t = 1.0 / (1.0 + np.exp(-(t - t_warmup_panel) / UC3_WARMUP_SCALE))
+
+    # ── Step 7: Structural equation ───────────────────────────────────────────
+    # Baseline: log-linear convergence (both strategies)
+    baseline = 0.40 + UC3_ALPHA_RS * np.log(t + 1.0)
+
+    # Time-varying strategy effect
+    strategy_effect = snr_mod_panel * g_t * strategy_panel
+
+    # Confounder terms (same weights as UC2)
+    confounder_terms = (
+        w["landscape_smoothness__norm_best_outcome"]   * ls_z_panel
+        + w["budget__norm_best_outcome"]               * bud_z_panel
+        + w["noise_level__norm_best_outcome"]          * nl_z_panel
+        + w["dimensionality__norm_best_outcome"]       * dim_z_panel
+        + w["initial_design_quality__norm_best_outcome"] * idq_z_panel
+        + w["snr__norm_best_outcome"]                  * snr_z_panel
+    )
+
+    # Per-step noise
+    step_noise = rng.normal(0.0, outcome_noise_sigma, total_rows)
+
+    latent_t = (
+        baseline
+        + strategy_effect
+        + confounder_terms
+        + batch_int_panel
+        + step_noise
+    )
+
+    # Clip to [0, 1] then take running maximum within each campaign
+    clipped_t = np.clip(latent_t, 0.0, 1.0)
+
+    # Running maximum: for each campaign, cummax over steps
+    # We process campaigns in order; step_arr is already 1..budget per campaign
+    best_t = np.empty(total_rows)
+    pos = 0
+    for b in budgets_int:
+        seg = clipped_t[pos:pos + b]
+        best_t[pos:pos + b] = np.maximum.accumulate(seg)
+        pos += b
+
+    # ── Assemble DataFrame ────────────────────────────────────────────────────
+    df = pd.DataFrame({
+        "campaign_id":            camp_idx_arr,
+        "step":                   step_arr,
+        "strategy":               strategy_panel.astype(int),
+        "norm_best_outcome_t":    best_t,
+        "latent_outcome_t":       latent_t,
+        "landscape_smoothness":   ls_panel,
+        "budget":                 bud_panel.astype(int),
+        "noise_level":            nl_panel,
+        "dimensionality":         dim_panel.astype(int),
+        "initial_design_quality": idq_panel,
+        "batch_id":               batch_id_panel,
+        "snr":                    snr_panel,
+        "snr_modulation":         snr_mod_panel,
+        "warmup_fraction":        wf_panel,
+        "t_warmup":               t_warmup_panel,
+        "g_t":                    g_t,
+        "p_bo":                   p_bo_panel,
+        "batch_intercept":        batch_int_panel,
+    })
+
+    # Enforce column order and schema
+    assert list(df.columns) == UC3_COLUMNS, (
+        f"Column mismatch.\nExpected: {UC3_COLUMNS}\nGot: {list(df.columns)}"
     )
 
     return df
