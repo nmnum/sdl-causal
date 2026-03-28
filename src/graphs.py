@@ -757,6 +757,273 @@ def get_uc3_adjustment_set() -> list[str]:
 GRAPH_REGISTRY["UC3"] = uc3_dag
 
 
+# ── UC4: Confounder Identification Sensitivity ────────────────────────────────
+#
+# Scientific question
+# -------------------
+# Are the confounders in our simulation design correctly identified?
+# Specifically: what happens to the ATE estimate when we use the wrong
+# adjustment set — omitting true confounders, adding spurious variables,
+# or conditioning on a collider?
+#
+# New elements relative to UC2
+# ----------------------------
+# Node  : observed_flag — a COLLIDER caused by both strategy and norm_best_outcome.
+#           Represents "did the experimenter flag this campaign as successful?"
+#           This is a realistic SDL scenario: success flags depend on both
+#           the strategy used and the result obtained.
+#           Role: collider (NOT a confounder — do NOT adjust for it).
+#
+# Structural equation for observed_flag:
+#   P(observed_flag = 1) = sigmoid(
+#       UC4_COLLIDER_W_STRATEGY × strategy
+#       + UC4_COLLIDER_W_OUTCOME × norm_best_outcome_std
+#       + ε
+#   )
+#
+# The 8 adjustment sets tested in UC4
+# ------------------------------------
+# Set 1 — CORRECT:          {budget, dim, ls, nl, snr}          (UC2 ground truth)
+# Set 2 — DROP_SNR:         {budget, dim, ls, nl}                (omit derived confounder)
+# Set 3 — DROP_LS:          {budget, dim, nl, snr}               (omit landscape_smoothness)
+# Set 4 — DROP_NL:          {budget, dim, ls, snr}               (omit noise_level)
+# Set 5 — DROP_SNR_RELATED: {budget, dim}                        (omit ls, nl, snr entirely)
+# Set 6 — EMPTY:            {}                                   (naive unadjusted)
+# Set 7 — ADD_NON_CONFOUNDER: correct + initial_design_quality   (spurious inclusion)
+# Set 8 — COLLIDER:         correct + observed_flag              (opens non-causal path; DOWNWARD bias via Berkson's paradox, empirically -41%)
+#
+# Expected bias directions
+# ------------------------
+# Set 2:    near-zero bias (snr is redundant given ls and nl; omitting it is harmless).
+# Sets 3–6: positive bias (BO preferentially assigned to high-SNR/easy campaigns
+#           → unadjusted ATE inflated). Bias grows as more confounders are dropped.
+# Set 7:    near-zero bias (initial_design_quality is not a confounder; adding it
+#           is harmless — it absorbs outcome variance but does not open new paths).
+# Set 8:    DOWNWARD bias (Berkson's paradox: conditioning on observed_flag attenuates
+#           the within-stratum strategy-outcome correlation because the collider was
+#           partly determined by strategy, not just outcome). Direction depends on
+#           the signs of the collider parent weights — both positive here → downward.
+#
+# Identification
+# --------------
+# The correct adjustment set is identical to UC2: {budget, dim, ls, nl, snr}.
+# observed_flag is a descendant of both strategy and outcome — conditioning on
+# it violates the backdoor criterion by opening a non-causal path.
+#
+# Reference: uc4_dag_reasoning.md
+
+# ── UC4 module-level constants ────────────────────────────────────────────────
+UC4_COLLIDER_W_STRATEGY: float = +1.5   # log-odds: BO campaigns more likely flagged
+UC4_COLLIDER_W_OUTCOME:  float = +2.0   # log-odds: better outcomes more likely flagged
+UC4_COLLIDER_INTERCEPT:  float = -1.0   # base log-odds of being flagged (~27% base rate)
+
+UC4_NODE_META: dict[str, dict] = {
+    **UC2_NODE_META,  # inherit all UC2 nodes (UC4 is campaign-level like UC2)
+    "observed_flag": {
+        "role": "collider",
+        "dtype": "binary",
+        "description": (
+            "Binary indicator: did the experimenter flag this campaign as "
+            "successful? Caused by BOTH strategy (BO campaigns flagged more "
+            "often) and norm_best_outcome (better outcomes flagged more often). "
+            "This is a COLLIDER — conditioning on it opens a non-causal path "
+            "strategy → observed_flag ← norm_best_outcome and induces spurious "
+            "correlation between strategy and outcome. "
+            "Do NOT include in the adjustment set."
+        ),
+    },
+}
+
+# ── UC4 adjustment set definitions ───────────────────────────────────────────
+# Each entry: (label, set_of_covariates, expected_bias_direction, description)
+# Used by get_uc4_adjustment_sets() and the analysis notebook.
+_UC4_ADJUSTMENT_SETS: list[dict] = [
+    {
+        "label":       "correct",
+        "covariates":  frozenset(["budget", "dimensionality",
+                                  "landscape_smoothness", "noise_level", "snr"]),
+        "bias_type":   "none",
+        "description": (
+            "Full UC2 adjustment set {budget, dim, ls, nl, snr}. "
+            "snr is technically redundant given ls and nl (snr = ls/nl), "
+            "but including it enables direct SNR moderation estimation (UC2) "
+            "and is the canonical set used throughout UC1–UC3."
+        ),
+        "expected_bias_direction": "zero",
+    },
+    {
+        "label":       "drop_snr",
+        "covariates":  frozenset(["budget", "dimensionality",
+                                  "landscape_smoothness", "noise_level"]),
+        "bias_type":   "omission",
+        "description": (
+            "Omit derived confounder snr (keep ls and nl). "
+            "Because snr = ls/nl, conditioning on ls and nl already blocks "
+            "all snr backdoor paths — expected near-zero bias."
+        ),
+        "expected_bias_direction": "zero",
+    },
+    {
+        "label":       "drop_ls",
+        "covariates":  frozenset(["budget", "dimensionality",
+                                  "noise_level", "snr"]),
+        "bias_type":   "omission",
+        "description": "Omit landscape_smoothness (keep nl and snr).",
+        "expected_bias_direction": "positive",
+    },
+    {
+        "label":       "drop_nl",
+        "covariates":  frozenset(["budget", "dimensionality",
+                                  "landscape_smoothness", "snr"]),
+        "bias_type":   "omission",
+        "description": "Omit noise_level (keep ls and snr).",
+        "expected_bias_direction": "positive",
+    },
+    {
+        "label":       "drop_snr_related",
+        "covariates":  frozenset(["budget", "dimensionality"]),
+        "bias_type":   "omission",
+        "description": "Omit all SNR-related confounders (ls, nl, snr).",
+        "expected_bias_direction": "positive",
+    },
+    {
+        "label":       "empty",
+        "covariates":  frozenset(),
+        "bias_type":   "omission",
+        "description": "Naive unadjusted ATE — no covariates at all.",
+        "expected_bias_direction": "positive",
+    },
+    {
+        "label":       "add_non_confounder",
+        "covariates":  frozenset(["budget", "dimensionality",
+                                  "landscape_smoothness", "noise_level", "snr",
+                                  "initial_design_quality"]),
+        "bias_type":   "spurious_inclusion",
+        "description": (
+            "Correct set + initial_design_quality (non-confounder: affects "
+            "outcome but not strategy). Should be harmless."
+        ),
+        "expected_bias_direction": "zero",
+    },
+    {
+        "label":       "collider",
+        "covariates":  frozenset(["budget", "dimensionality",
+                                  "landscape_smoothness", "noise_level", "snr",
+                                  "observed_flag"]),
+        "bias_type":   "collider",
+        "description": (
+            "Correct set + observed_flag (collider: caused by both strategy "
+            "and outcome). Introduces downward bias via Berkson's paradox: "
+            "conditioning on the collider attenuates the within-stratum "
+            "strategy-outcome correlation (observed empirically: -41% bias)."
+        ),
+        "expected_bias_direction": "negative",
+    },
+]
+
+
+def uc4_dag() -> nx.DiGraph:
+    """
+    Return the UC4 causal DAG as a networkx.DiGraph.
+
+    Scientific question
+    -------------------
+    Are the confounders in our simulation design correctly identified?
+    What is the bias from using the wrong adjustment set?
+
+    New elements relative to UC2
+    ----------------------------
+    Node  : observed_flag — a collider caused by strategy and norm_best_outcome.
+              Role: collider (do NOT adjust for it).
+
+    Edges :
+      strategy         → observed_flag  (BO campaigns more likely flagged)
+      norm_best_outcome → observed_flag  (better outcomes more likely flagged)
+
+    The UC2 structural equations are unchanged — observed_flag is a
+    downstream consequence, not a cause of strategy or outcome.
+
+    Identification
+    --------------
+    Correct adjustment set: {budget, dimensionality, landscape_smoothness,
+    noise_level, snr} — identical to UC2.
+
+    observed_flag must NOT be in the adjustment set: it is a collider
+    (descendant of both strategy and outcome). Conditioning on it opens
+    the path strategy → observed_flag ← norm_best_outcome, inducing
+    spurious correlation.
+
+    Returns
+    -------
+    nx.DiGraph
+        Inherits all UC2 nodes and edges.
+        Adds: observed_flag node, strategy→observed_flag,
+              norm_best_outcome→observed_flag edges.
+    """
+    G = uc2_dag()
+    G.graph["name"] = "UC4_confounder_sensitivity"
+
+    # Update node metadata to UC4 version
+    for node, meta in UC4_NODE_META.items():
+        if node not in G.nodes:
+            G.add_node(node, **meta)
+        else:
+            G.nodes[node].update(meta)
+
+    # ── New node: observed_flag ───────────────────────────────────────────────
+    G.add_node("observed_flag", **UC4_NODE_META["observed_flag"])
+
+    # ── strategy → observed_flag ──────────────────────────────────────────────
+    G.add_edge(
+        "strategy", "observed_flag",
+        weight=UC4_COLLIDER_W_STRATEGY,
+        rationale=(
+            "BO campaigns are more likely to be flagged as successful because "
+            "practitioners associate BO with rigorous methodology, independent "
+            "of the actual outcome. Log-odds weight = "
+            f"{UC4_COLLIDER_W_STRATEGY:+.1f}."
+        ),
+    )
+
+    # ── norm_best_outcome → observed_flag ─────────────────────────────────────
+    G.add_edge(
+        "norm_best_outcome", "observed_flag",
+        weight=UC4_COLLIDER_W_OUTCOME,
+        rationale=(
+            "Campaigns with better outcomes are more likely to be flagged as "
+            "successful — the primary driver of the success flag. "
+            f"Log-odds weight = {UC4_COLLIDER_W_OUTCOME:+.1f}."
+        ),
+    )
+
+    return G
+
+
+def get_uc4_adjustment_sets() -> list[dict]:
+    """
+    Return the 8 UC4 adjustment sets as a list of dicts.
+
+    Each dict has keys:
+      label       : str         — short identifier
+      covariates  : frozenset   — set of covariate names to include in OLS
+      bias_type   : str         — 'none' | 'omission' | 'spurious_inclusion' | 'collider'
+      description : str         — human-readable description
+      expected_bias_direction : str — 'zero' | 'positive' | 'negative'
+
+    The correct adjustment set is the first entry (label='correct').
+    """
+    return list(_UC4_ADJUSTMENT_SETS)
+
+
+def get_uc4_correct_adjustment_set() -> list[str]:
+    """Return the correct UC4 adjustment set (identical to UC2)."""
+    return get_uc2_adjustment_set()
+
+
+# ── Update registry ───────────────────────────────────────────────────────────
+GRAPH_REGISTRY["UC4"] = uc4_dag
+
+
 if __name__ == "__main__":
     print("=== UC1 ===")
     G1 = uc1_dag()
@@ -799,3 +1066,16 @@ if __name__ == "__main__":
     print(f"  UC3_WARMUP_W_SNR = {UC3_WARMUP_W_SNR}")
     print(f"  UC3_WARMUP_W_IDQ = {UC3_WARMUP_W_IDQ}")
     print(f"  UC3_STEP_NOISE   = {UC3_STEP_NOISE}")
+
+    print("\n=== UC4 ===")
+    G4 = uc4_dag()
+    summarise(G4)
+    adj4 = get_uc4_correct_adjustment_set()
+    print(f"\nCorrect adjustment set: {adj4}")
+    print(f"Number of adjustment sets to test: {len(get_uc4_adjustment_sets())}")
+    for s in get_uc4_adjustment_sets():
+        print(f"  [{s['bias_type']:20s}] {s['label']:25s} — {s['description'][:60]}")
+    assert "observed_flag" in G4.nodes, "observed_flag node missing from UC4 DAG"
+    assert G4.has_edge("strategy", "observed_flag"), "strategy→observed_flag edge missing"
+    assert G4.has_edge("norm_best_outcome", "observed_flag"), "outcome→observed_flag edge missing"
+    print("Assertions passed: UC4 DAG structure correct.")

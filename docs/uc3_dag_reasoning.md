@@ -1,4 +1,4 @@
-# Use Case 3: Convergence Curves — Time-Varying Strategy Effect
+# Use Case 3: Convergence Curves - Time Varying Strategy Effect
 
 **Status**: Reasoning complete, implementation done
 **DoWhy feature**: Time-varying ATE via OLS with `strategy × log(t)` interaction + cluster-robust SEs

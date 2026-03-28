@@ -68,12 +68,14 @@ import pandas as pd
 # graphs.py is the single source of truth for edge weights.
 # Import the DAG and read weights from it rather than hardcoding them here.
 from src.graphs import (
-    uc1_dag, uc2_dag, uc3_dag,
+    uc1_dag, uc2_dag, uc3_dag, uc4_dag,
     get_adjustment_set, get_uc2_adjustment_set, get_uc3_adjustment_set,
+    get_uc4_adjustment_sets, get_uc4_correct_adjustment_set,
     UC1_NODE_META,
     UC2_SNR_THRESHOLD, UC2_SNR_SCALE, UC2_BO_FLOOR, UC2_BO_CEILING,
     UC3_ALPHA_RS, UC3_WARMUP_BASE, UC3_WARMUP_SCALE,
     UC3_WARMUP_W_DIM, UC3_WARMUP_W_SNR, UC3_WARMUP_W_IDQ, UC3_STEP_NOISE,
+    UC4_COLLIDER_W_STRATEGY, UC4_COLLIDER_W_OUTCOME, UC4_COLLIDER_INTERCEPT,
 )
 
 
@@ -107,6 +109,18 @@ UC2_COLUMNS: list[str] = UC1_COLUMNS + [
     "snr_modulation",         # float in [UC2_BO_FLOOR, UC2_BO_CEILING],
                               #   f(snr): the realised BO advantage multiplier
                               #   for this campaign.  Ground truth ATE = E[f(snr)].
+]
+
+# UC4_COLUMNS: extends UC2 with the observed_flag collider column.
+# observed_flag is a binary indicator caused by both strategy and norm_best_outcome.
+# It is a COLLIDER — do NOT include in the adjustment set.
+UC4_COLUMNS: list[str] = UC2_COLUMNS + [
+    "observed_flag",          # int {0, 1}, collider: P(flag=1) = sigmoid(
+                              #   UC4_COLLIDER_W_STRATEGY × strategy
+                              #   + UC4_COLLIDER_W_OUTCOME × norm_best_outcome_std
+                              #   + UC4_COLLIDER_INTERCEPT)
+                              # Caused by both strategy and norm_best_outcome.
+                              # Conditioning on this opens a non-causal path.
 ]
 
 # UC3_COLUMNS: one row per (campaign, step).
@@ -334,7 +348,7 @@ def run_campaigns(
         If True, raise NotImplementedError.  Reserved for UC3 (time-varying
         strategy switches), which requires step-by-step BO replay.
 
-    use_case : {"UC1", "UC2"}
+    use_case : {"UC1", "UC2", "UC4"}
         Which causal DAG / structural equation to use.
 
         "UC1" (default):
@@ -349,6 +363,17 @@ def run_campaigns(
             distribution and tau), NOT the fixed +0.10 of UC1.
             Use latent_outcome for causal estimation (same reason as UC1:
             ceiling clipping censors BO campaigns disproportionately).
+
+        "UC4":
+            Extends UC2 with an observed_flag collider column.
+            observed_flag ~ Bernoulli(sigmoid(
+                UC4_COLLIDER_W_STRATEGY × strategy
+                + UC4_COLLIDER_W_OUTCOME × norm_best_outcome_std
+                + UC4_COLLIDER_INTERCEPT))
+            The structural equations for strategy and norm_best_outcome are
+            identical to UC2 — only the collider column is added.
+            Returns UC4_COLUMNS (superset of UC2_COLUMNS).
+            Ground truth ATE is identical to UC2.
 
     tau : float or None
         SNR threshold passed to snr_modulation_fn().  Only used when
@@ -395,9 +420,9 @@ def run_campaigns(
     The intercepts are chosen so that E[norm_best_outcome] ≈ 0.65 and
     E[p_bo] ≈ 0.50, matching the rough empirical base rates.
     """
-    if use_case not in ("UC1", "UC2"):
+    if use_case not in ("UC1", "UC2", "UC4"):
         raise ValueError(
-            f"use_case must be 'UC1' or 'UC2', got {use_case!r}. "
+            f"use_case must be 'UC1', 'UC2', or 'UC4', got {use_case!r}. "
             "For UC3 (convergence curves / step-level panel), use "
             "run_campaigns_uc3() instead."
         )
@@ -412,7 +437,12 @@ def run_campaigns(
     rng = np.random.default_rng(seed)
 
     # ── Load DAG and read edge weights ────────────────────────────────────────
-    G = uc2_dag() if use_case == "UC2" else uc1_dag()
+    # UC4 uses the UC2 structural equations (same confounders, same strategy
+    # effect) — only the collider column is added downstream.
+    if use_case in ("UC2", "UC4"):
+        G = uc4_dag() if use_case == "UC4" else uc2_dag()
+    else:
+        G = uc1_dag()
     w = _read_edge_weights(G)
 
     # ── Step 1: Draw confounders ──────────────────────────────────────────────
@@ -466,8 +496,8 @@ def run_campaigns(
         + w["noise_level__strategy"]          * nl_z
         + w["dimensionality__strategy"]       * dim_z
     )
-    if use_case == "UC2":
-        # SNR additionally confounds strategy choice in UC2
+    if use_case in ("UC2", "UC4"):
+        # SNR additionally confounds strategy choice in UC2/UC4
         logit_p += w["snr__strategy"] * snr_z
 
     p_bo = 1.0 / (1.0 + np.exp(-logit_p))       # sigmoid
@@ -483,7 +513,7 @@ def run_campaigns(
         strategy_contribution = w["strategy__norm_best_outcome"] * strategy
         snr_modulation = np.full(n_campaigns, w["strategy__norm_best_outcome"])
     else:
-        # UC2: strategy effect is modulated by SNR
+        # UC2 / UC4: strategy effect is modulated by SNR
         # f(snr; tau) ∈ [UC2_BO_FLOOR, UC2_BO_CEILING] = [-0.05, +0.10]
         # Ground truth ATE = E[f(snr; tau)] (depends on SNR distribution and tau)
         snr_modulation = snr_modulation_fn(snr, tau=tau)
@@ -500,7 +530,7 @@ def run_campaigns(
         + batch_intercept
         + rng.normal(0.0, outcome_noise_sigma, n_campaigns)
     )
-    if use_case == "UC2":
+    if use_case in ("UC2", "UC4"):
         # SNR has a direct effect on outcome (separate from moderation)
         latent_outcome += w["snr__norm_best_outcome"] * snr_z
 
@@ -531,12 +561,36 @@ def run_campaigns(
         "batch_intercept":        batch_intercept,
     })
 
-    if use_case == "UC2":
+    if use_case in ("UC2", "UC4"):
         df["snr"]            = snr
         df["snr_modulation"] = snr_modulation
 
+    if use_case == "UC4":
+        # ── Collider: observed_flag ───────────────────────────────────────────
+        # P(observed_flag = 1) = sigmoid(
+        #     UC4_COLLIDER_W_STRATEGY × strategy
+        #     + UC4_COLLIDER_W_OUTCOME × norm_best_outcome_std
+        #     + UC4_COLLIDER_INTERCEPT
+        # )
+        # norm_best_outcome is standardised before entering the logit so that
+        # the collider weight is on a comparable scale to the strategy weight.
+        nbo_std = (norm_best - norm_best.mean()) / (norm_best.std() + 1e-12)
+        logit_flag = (
+            UC4_COLLIDER_INTERCEPT
+            + UC4_COLLIDER_W_STRATEGY * strategy
+            + UC4_COLLIDER_W_OUTCOME  * nbo_std
+        )
+        p_flag = 1.0 / (1.0 + np.exp(-logit_flag))
+        observed_flag = rng.binomial(1, p_flag, n_campaigns)
+        df["observed_flag"] = observed_flag.astype(int)
+
     # Enforce column order and schema
-    expected_cols = UC2_COLUMNS if use_case == "UC2" else UC1_COLUMNS
+    if use_case == "UC4":
+        expected_cols = UC4_COLUMNS
+    elif use_case == "UC2":
+        expected_cols = UC2_COLUMNS
+    else:
+        expected_cols = UC1_COLUMNS
     assert list(df.columns) == expected_cols, (
         f"Column mismatch.\nExpected: {expected_cols}\nGot: {list(df.columns)}"
     )
