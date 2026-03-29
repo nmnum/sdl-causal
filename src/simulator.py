@@ -348,7 +348,7 @@ def run_campaigns(
         If True, raise NotImplementedError.  Reserved for UC3 (time-varying
         strategy switches), which requires step-by-step BO replay.
 
-    use_case : {"UC1", "UC2", "UC4"}
+    use_case : {"UC1", "UC2", "UC4", "UC5"}
         Which causal DAG / structural equation to use.
 
         "UC1" (default):
@@ -357,6 +357,10 @@ def run_campaigns(
 
         "UC2":
             strategy effect is modulated by SNR via snr_modulation_fn().
+
+        "UC5":
+            Alias for "UC2". UC5 uses the same DGP; the ATT estimand is
+            an estimation-layer change only (see uc5_dag_reasoning.md).
             Adds 'snr' and 'snr_modulation' columns.
             Returns UC2_COLUMNS.
             The ground truth ATE is E[f(snr; tau)] (depends on the SNR
@@ -420,9 +424,15 @@ def run_campaigns(
     The intercepts are chosen so that E[norm_best_outcome] ≈ 0.65 and
     E[p_bo] ≈ 0.50, matching the rough empirical base rates.
     """
+    # UC5 uses the same DGP as UC2 — ATT is an estimation-layer change only.
+    # Aliasing here keeps notebooks explicit ("use_case='UC5'") without
+    # duplicating any simulation logic.
+    if use_case == "UC5":
+        use_case = "UC2"
+
     if use_case not in ("UC1", "UC2", "UC4"):
         raise ValueError(
-            f"use_case must be 'UC1', 'UC2', or 'UC4', got {use_case!r}. "
+            f"use_case must be 'UC1', 'UC2', 'UC4', or 'UC5', got {use_case!r}. "
             "For UC3 (convergence curves / step-level panel), use "
             "run_campaigns_uc3() instead."
         )

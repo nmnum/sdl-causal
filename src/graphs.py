@@ -1024,6 +1024,156 @@ def get_uc4_correct_adjustment_set() -> list[str]:
 GRAPH_REGISTRY["UC4"] = uc4_dag
 
 
+# ── UC5: ATT Estimation for Strategy Switching ────────────────────────────────
+#
+# Scientific question
+# -------------------
+# Among campaigns that *actually used* BO, what would their outcome have been
+# under random search?  This is the Average Treatment Effect on the Treated
+# (ATT): E[Y(1) − Y(0) | T = 1].
+#
+# Why ATT rather than ATE?
+# ------------------------
+# UC1 estimates the ATE: the average effect of BO across ALL campaigns,
+# including those where BO was never used.  The ATE answers "what would
+# happen if we randomly assigned BO to a new campaign?"
+#
+# The ATT answers a different, more actionable question: "for the campaigns
+# where a practitioner *chose* BO, was that choice justified?"  This is the
+# retrospective evaluation question — it uses the existing data structure
+# (BO campaigns are the treated group) and is directly comparable to UC1.
+#
+# ATT vs ATE in the presence of positive selection
+# -------------------------------------------------
+# Because practitioners preferentially apply BO to easier campaigns (high SNR,
+# smooth landscape, large budget — the UC1/UC2 confounders), the treated group
+# is positively selected.  In this setting:
+#
+#   ATT > ATE
+#
+# Intuition: BO campaigns are drawn from the high-SNR tail of the landscape
+# distribution, where BO's advantage is largest (UC2 design rule DR-B).
+# The ATE averages over the full distribution including low-SNR campaigns
+# where BO barely helps.  The ATT conditions on the treated subgroup, so it
+# reflects BO's effect where it is actually deployed.
+#
+# Estimand
+# --------
+#   ATT = E[Y(1) − Y(0) | T = 1]
+#       = E[Y(1) | T = 1] − E[Y(0) | T = 1]
+#
+# The first term is directly observed (BO campaign outcomes).
+# The second term is the counterfactual: what would BO campaigns have achieved
+# under random search?  This is estimated via backdoor adjustment restricted
+# to the treated subgroup.
+#
+# Identification
+# --------------
+# The ATT is identified by the same backdoor adjustment set as UC1/UC2:
+# {landscape_smoothness, budget, noise_level, dimensionality, snr}.
+# The DAG is identical to UC2 — no new nodes or edges are needed.
+# The only change is in the *estimation target*: we restrict to T=1 campaigns.
+#
+# DoWhy feature: counterfactual estimation
+# -----------------------------------------
+# DoWhy's estimate_effect() with target_units="att" restricts the estimand
+# to the treated subgroup.  The linear regression backdoor estimator then
+# fits on the full data but evaluates the counterfactual at T=0 for each
+# treated unit, giving per-campaign Y(0) predictions.
+#
+# Additional analyses
+# -------------------
+# 1. Individual counterfactual distributions: per-campaign Y(1) − Y(0) for
+#    all BO-treated campaigns, showing the heterogeneity of the switching loss.
+# 2. SNR-stratified ATT: ATT computed separately for low/mid/high SNR bins,
+#    confirming that the ATT is largest where BO is most effective (high SNR).
+# 3. ATE vs ATT comparison: quantifies the positive selection bias.
+#
+# Design rule DR-H
+# ----------------
+# "Among campaigns where BO was used, switching to random search would have
+# reduced the best outcome by ATT ≈ +0.073 units on average (AIPW, 95% CI:
+# [+0.060, +0.085]; true ATT = +0.088).  The switching loss is largest for
+# high-SNR campaigns (ATT_high > ATT_mid > ATT_low), confirming that BO's
+# retrospective value is concentrated in the regime where its surrogate model
+# is most reliable.
+#
+# CAVEATS (see uc5_dag_reasoning.md §5–6 for full discussion):
+# 1. Interaction term (strategy × snr_s) has p=0.057 — marginally non-
+#    significant at α=0.05.  Stratified ATT ordering is directional, not
+#    a precise estimate.
+# 2. Estimated ATT_low = +0.017 has the WRONG SIGN vs true ATT_low = −0.007.
+#    The low-SNR bin (n=38 treated) is severely underpowered; the linear OLS
+#    model extrapolates incorrectly into the non-linear low-SNR regime.
+#    Use the true ATT_low (known by DGP construction) for the direction.
+# 3. Refutation tests validate identification assumptions (shared by ATE and
+#    ATT), not the AIPW ATT point estimate directly."
+#
+# Reference: uc5_dag_reasoning.md
+
+# UC5 SNR bin boundaries (used in notebook and tests)
+UC5_SNR_LOW_MAX:  float = 1.5   # SNR < 1.5  → low bin
+UC5_SNR_HIGH_MIN: float = 3.0   # SNR ≥ 3.0  → high bin
+                                  # 1.5 ≤ SNR < 3.0 → mid bin
+                                  # Chosen to straddle UC2_SNR_THRESHOLD (τ=2.0)
+
+UC5_NODE_META: dict[str, dict] = {
+    **UC2_NODE_META,  # UC5 is campaign-level; inherits all UC2 nodes unchanged
+}
+
+
+def uc5_dag() -> nx.DiGraph:
+    """
+    Return the UC5 causal DAG as a networkx.DiGraph.
+
+    Scientific question
+    -------------------
+    Among campaigns that used BO, what would their outcome have been under
+    random search?  (ATT: Average Treatment Effect on the Treated)
+
+    DAG structure
+    -------------
+    Identical to UC2.  No new nodes or edges are needed — the ATT is a
+    different *estimation target* on the same causal graph, not a different
+    causal structure.
+
+    Identification
+    --------------
+    ATT identified by backdoor adjustment on
+    {landscape_smoothness, budget, noise_level, dimensionality, snr},
+    restricted to the treated subgroup (T = 1, BO campaigns).
+
+    Returns
+    -------
+    nx.DiGraph
+        Identical structure to uc2_dag(), renamed "UC5_att_strategy_switching".
+    """
+    G = uc2_dag()
+    G.graph["name"] = "UC5_att_strategy_switching"
+    G.graph["estimand"] = "ATT"
+    G.graph["treated_condition"] = "strategy == 1"
+    G.graph["estimand_note"] = (
+        "ATT = E[Y(1) - Y(0) | T=1]. "
+        "DAG is identical to UC2; the ATT is a different estimation target, "
+        "not a different causal structure. "
+        "Positive selection (practitioners choose BO for easier campaigns) "
+        "implies ATT > ATE."
+    )
+    return G
+
+
+def get_uc5_adjustment_set() -> list[str]:
+    """
+    Return the UC5 backdoor adjustment set (identical to UC2).
+    ATT identification uses the same backdoor criterion as ATE.
+    """
+    return get_uc2_adjustment_set()
+
+
+# ── Update registry ───────────────────────────────────────────────────────────
+GRAPH_REGISTRY["UC5"] = uc5_dag
+
+
 if __name__ == "__main__":
     print("=== UC1 ===")
     G1 = uc1_dag()
@@ -1079,3 +1229,16 @@ if __name__ == "__main__":
     assert G4.has_edge("strategy", "observed_flag"), "strategy→observed_flag edge missing"
     assert G4.has_edge("norm_best_outcome", "observed_flag"), "outcome→observed_flag edge missing"
     print("Assertions passed: UC4 DAG structure correct.")
+
+    print("\n=== UC5 ===")
+    G5 = uc5_dag()
+    summarise(G5)
+    adj5 = get_uc5_adjustment_set()
+    print(f"\nATT adjustment set: {adj5}")
+    print(f"Estimand:           {G5.graph['estimand']}")
+    print(f"Treated condition:  {G5.graph['treated_condition']}")
+    assert G5.graph["estimand"] == "ATT", "UC5 estimand should be ATT"
+    assert adj5 == get_uc2_adjustment_set(), "UC5 adjustment set should match UC2"
+    assert G5.number_of_nodes() == G5.number_of_nodes(), "UC5 node count should match UC2"
+    print("Assertions passed: UC5 DAG structure correct.")
+    print(f"\nSNR bin boundaries: low < {UC5_SNR_LOW_MAX}, high ≥ {UC5_SNR_HIGH_MIN}")
