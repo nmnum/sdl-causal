@@ -1174,6 +1174,285 @@ def get_uc5_adjustment_set() -> list[str]:
 GRAPH_REGISTRY["UC5"] = uc5_dag
 
 
+# ── UC6: Mid-Campaign Distribution Shift ──────────────────────────────────────
+#
+# Scientific question
+# -------------------
+# If the noise level of an experimental system increases mid-campaign, does
+# this causally degrade campaign outcome?  Does the degradation depend on
+# *when* the shift occurs and *how large* it is?  Does BO suffer more than
+# random search?
+#
+# New elements relative to UC3
+# ----------------------------
+# Node  : shift_time      — step at which noise level increases (time-varying confounder)
+# Node  : shift_magnitude — multiplicative factor: post-shift noise = noise_level × shift_magnitude
+# Node  : post_shift      — binary indicator: 1 if step > shift_time, else 0 (derived)
+#
+# The core identification challenge
+# ----------------------------------
+# In UC1–UC5, all confounders are fixed at campaign start.  In UC6, noise_level
+# is time-varying: it is noise_level before shift_time and noise_level × shift_magnitude
+# after.  The static backdoor adjustment set from UC2/UC3 is INSUFFICIENT — it
+# does not block the backdoor path through shift_magnitude.
+#
+# Correct adjustment set: {budget, dim, ls, nl, snr, shift_time, shift_magnitude}
+# (extends UC2/UC3 by adding shift_time and shift_magnitude)
+#
+# Estimator: Interrupted Time Series (ITS) with DiD interpretation.
+# Cluster-robust SEs at campaign level (same reason as UC3).
+#
+# Structural equation (per step t within campaign c):
+#
+#   effective_noise(t) = noise_level_c                          if t ≤ shift_time_c
+#                      = noise_level_c × shift_magnitude_c      if t > shift_time_c
+#
+#   effective_snr(t)   = landscape_smoothness_c / effective_noise(t)
+#
+#   strategy_effect(t) = f(effective_snr(t)) × g(t; t_warmup_c) × strategy_c
+#
+#   norm_best_outcome_t = baseline(t)
+#                       + strategy_effect(t)
+#                       + [UC3 confounder terms]
+#                       + UC6_SHIFT_TIME_W   × shift_time_std_c
+#                       + UC6_SHIFT_MAG_W    × shift_magnitude_std_c
+#                       + UC6_POST_SHIFT_W   × post_shift_t
+#                       + ε_t
+#
+# Distribution parameters
+# -----------------------
+#   shift_time      ~ Uniform(0.2 × budget, 0.8 × budget)
+#   shift_magnitude ~ LogNormal(log(3), 0.3)  [noise triples on average]
+#
+# Reference: uc6_dag_reasoning.md
+
+# ── UC6 module-level constants ────────────────────────────────────────────────
+UC6_SHIFT_TIME_W:   float = +0.05  # shift_time → outcome: later shift → better outcome
+                                    # (positive: later shift_time = less of campaign degraded)
+                                    # Standardised: higher shift_time_std = later shift = better outcome
+UC6_SHIFT_MAG_W:    float = -0.08  # shift_magnitude → outcome: larger shift → worse outcome
+UC6_POST_SHIFT_W:   float = -0.04  # post_shift → outcome: post-shift steps are harder
+UC6_SHIFT_MAG_SEL:  float = -0.15  # shift_magnitude → strategy (log-odds):
+                                    # large shifts reduce P(BO) — practitioners switch away
+UC6_SHIFT_MAG_MU:   float = float("nan")  # placeholder; set to log(3) in simulator
+UC6_SHIFT_MAG_SIGMA: float = 0.30  # LogNormal sigma for shift_magnitude
+UC6_SHIFT_TIME_LOW:  float = 0.20  # shift occurs no earlier than 20% of budget
+UC6_SHIFT_TIME_HIGH: float = 0.80  # shift occurs no later than 80% of budget
+
+# Compute the actual LogNormal mu so that E[shift_magnitude] = 3.0
+# E[LogNormal(mu, sigma)] = exp(mu + sigma²/2)
+# → mu = log(3) - sigma²/2
+import math as _math
+UC6_SHIFT_MAG_MU = _math.log(3.0) - 0.5 * UC6_SHIFT_MAG_SIGMA ** 2
+
+UC6_NODE_META: dict[str, dict] = {
+    **UC3_NODE_META,  # inherit all UC3 nodes
+    "shift_time": {
+        "role": "time_varying_confounder",
+        "dtype": "continuous",
+        "description": (
+            "Step at which the noise level increases mid-campaign. "
+            "Drawn from Uniform(0.2×budget, 0.8×budget). "
+            "Affects outcome (earlier shift → more of campaign degraded) "
+            "and is a confounder: practitioners who notice the shift may "
+            "change strategy. Must be in the adjustment set."
+        ),
+    },
+    "shift_magnitude": {
+        "role": "time_varying_confounder",
+        "dtype": "continuous",
+        "description": (
+            "Multiplicative factor for post-shift noise: "
+            "effective_noise(t > shift_time) = noise_level × shift_magnitude. "
+            f"Drawn from LogNormal(mu={UC6_SHIFT_MAG_MU:.3f}, sigma={UC6_SHIFT_MAG_SIGMA:.2f}), "
+            "so E[shift_magnitude] = 3.0 (noise triples on average). "
+            "Affects outcome (larger shift → worse) and strategy choice "
+            "(large shifts reduce P(BO)). Must be in the adjustment set."
+        ),
+    },
+    "post_shift": {
+        "role": "derived",
+        "dtype": "binary",
+        "description": (
+            "Binary indicator: 1 if step > shift_time, else 0. "
+            "Deterministic function of step and shift_time. "
+            "Used directly in the ITS regression model."
+        ),
+    },
+}
+
+
+def uc6_dag() -> nx.DiGraph:
+    """
+    Return the UC6 causal DAG as a networkx.DiGraph.
+
+    Scientific question
+    -------------------
+    Does a mid-campaign noise increase causally degrade campaign outcome?
+    Does the degradation depend on when the shift occurs and how large it is?
+    Is BO more sensitive to the shift than random search?
+
+    New elements relative to UC3
+    ----------------------------
+    Nodes : shift_time, shift_magnitude, post_shift
+              shift_time      — when the noise level increases (time-varying confounder)
+              shift_magnitude — how much noise increases (time-varying confounder)
+              post_shift      — binary: 1 if step > shift_time (derived)
+
+    Edges :
+      shift_time      → norm_best_outcome_t  (earlier shift → more degradation)
+      shift_magnitude → norm_best_outcome_t  (larger shift → more degradation)
+      shift_magnitude → strategy             (large shifts reduce P(BO))
+      post_shift      → norm_best_outcome_t  (post-shift steps are harder)
+
+    Core identification challenge
+    -----------------------------
+    The static UC2/UC3 adjustment set {budget, dim, ls, nl, snr} is INSUFFICIENT
+    for UC6.  The backdoor path strategy ← shift_magnitude → norm_best_outcome_t
+    is not blocked by the static set.  The correct adjustment set adds
+    shift_time and shift_magnitude.
+
+    Estimator
+    ---------
+    Interrupted Time Series (ITS) with DiD interpretation.
+    Cluster-robust SEs at campaign level.
+
+    Returns
+    -------
+    nx.DiGraph
+        Inherits all UC3 nodes and edges.
+        Adds: shift_time, shift_magnitude, post_shift nodes and their edges.
+    """
+    # Start from UC3 DAG and extend
+    G = uc3_dag()
+    G.graph["name"] = "UC6_distribution_shift"
+
+    # Update node metadata to UC6 version
+    for node, meta in UC6_NODE_META.items():
+        if node not in G.nodes:
+            G.add_node(node, **meta)
+        else:
+            G.nodes[node].update(meta)
+
+    # ── shift_time → norm_best_outcome_t ─────────────────────────────────────
+    # Later shift_time means less of the campaign is affected by the noise
+    # increase.  Effect is positive: later shift → better final outcome.
+    # Weight is on the standardised scale (same convention as UC3 confounders).
+    # shift_time_std > 0 means the shift occurs later → less degradation → better outcome.
+    G.add_edge(
+        "shift_time", "norm_best_outcome_t",
+        weight=UC6_SHIFT_TIME_W,
+        rationale=(
+            "Later shift_time means a smaller fraction of the campaign "
+            "is run under elevated noise, so the best outcome found is higher. "
+            f"Weight = {UC6_SHIFT_TIME_W:+.2f} (standardised scale). "
+            "Positive: higher shift_time_std = later shift = less degradation = better outcome."
+        ),
+    )
+
+    # ── shift_magnitude → norm_best_outcome_t ────────────────────────────────
+    # Larger shift_magnitude → lower post-shift SNR → more BO degradation.
+    # Also degrades RS (noisier measurements), but less severely.
+    G.add_edge(
+        "shift_magnitude", "norm_best_outcome_t",
+        weight=UC6_SHIFT_MAG_W,
+        rationale=(
+            "Larger noise increase → lower post-shift SNR → more BO surrogate "
+            "miscalibration and noisier measurements for both strategies. "
+            f"Weight = {UC6_SHIFT_MAG_W:+.2f} (standardised scale)."
+        ),
+    )
+
+    # ── shift_magnitude → strategy (confounding) ─────────────────────────────
+    # Practitioners who notice a large noise increase may switch away from BO
+    # (because they know BO degrades in high-noise regimes — UC2 design rule).
+    # This creates a backdoor path that must be blocked.
+    G.add_edge(
+        "shift_magnitude", "strategy",
+        weight=UC6_SHIFT_MAG_SEL,
+        rationale=(
+            "Practitioners aware of noise-strategy interactions (UC2 design rule) "
+            "are less likely to choose BO when they observe a large noise increase. "
+            f"Log-odds weight = {UC6_SHIFT_MAG_SEL:+.2f}. "
+            "This is the confounding path that makes the static adjustment set "
+            "insufficient for UC6."
+        ),
+    )
+
+    # ── post_shift → norm_best_outcome_t ─────────────────────────────────────
+    # Post-shift steps are harder for both strategies: noisier measurements
+    # mean the running maximum improves more slowly.
+    G.add_edge(
+        "post_shift", "norm_best_outcome_t",
+        weight=UC6_POST_SHIFT_W,
+        rationale=(
+            "Post-shift steps have higher measurement noise, slowing the "
+            "improvement of the running maximum for both strategies. "
+            f"Weight = {UC6_POST_SHIFT_W:+.2f} (standardised scale). "
+            "This is the direct effect of the shift on outcome, separate "
+            "from the differential BO degradation (captured in the structural "
+            "equation via effective_snr)."
+        ),
+    )
+
+    # ── Annotate strategy → norm_best_outcome_t with UC6 shift metadata ──────
+    G["strategy"]["norm_best_outcome_t"].update({
+        "moderated_by":    "snr_step_and_shift",
+        "moderation_fn":   "effective_snr_sigmoid_times_warmup_sigmoid",
+        "shift_time_low":  UC6_SHIFT_TIME_LOW,
+        "shift_time_high": UC6_SHIFT_TIME_HIGH,
+        "shift_mag_mu":    UC6_SHIFT_MAG_MU,
+        "shift_mag_sigma": UC6_SHIFT_MAG_SIGMA,
+        "weight_note": (
+            "weight=+0.10 is the noise-free, end-of-campaign ceiling. "
+            "Actual effect at step t = f(effective_snr(t)) × g(t; t_warmup). "
+            "effective_snr(t) = snr if t ≤ shift_time else snr/shift_magnitude. "
+            "See UC6_SHIFT_* constants and uc6_dag_reasoning.md §4."
+        ),
+    })
+
+    return G
+
+
+def get_uc6_adjustment_set() -> list[str]:
+    """
+    Return the UC6 correct backdoor adjustment set, sorted alphabetically.
+
+    Extends UC2/UC3 by adding shift_time and shift_magnitude.
+    The static UC2/UC3 set is INSUFFICIENT for UC6 — see uc6_dag_reasoning.md §5.
+
+    Returns
+    -------
+    list[str]
+        ['budget', 'dimensionality', 'landscape_smoothness', 'noise_level',
+         'shift_magnitude', 'shift_time', 'snr']
+    """
+    return sorted([
+        "landscape_smoothness", "budget", "noise_level", "dimensionality",
+        "snr", "shift_time", "shift_magnitude",
+    ])
+
+
+def get_uc6_static_adjustment_set() -> list[str]:
+    """
+    Return the INSUFFICIENT static adjustment set for UC6 (UC2/UC3 set).
+
+    This is the set an analyst would use if they ignored the noise shift.
+    It is provided here so tests and notebooks can explicitly demonstrate
+    the identification failure.
+
+    Returns
+    -------
+    list[str]
+        Same as get_uc2_adjustment_set() / get_uc3_adjustment_set().
+    """
+    return get_uc2_adjustment_set()
+
+
+# ── Update registry ───────────────────────────────────────────────────────────
+GRAPH_REGISTRY["UC6"] = uc6_dag
+
+
 if __name__ == "__main__":
     print("=== UC1 ===")
     G1 = uc1_dag()

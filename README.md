@@ -53,6 +53,31 @@ Each use case is a distinct causal question. They are ordered from conceptually 
 | UC2 | Complete | `notebooks/uc2_noise_moderation.ipynb` | `uc2_dag_reasoning.md` | DR-B/C: BO advantage collapses below SNR τ=2.0 |
 | UC3 | Complete | `notebooks/uc3_convergence_curves.ipynb` | `uc3_dag_reasoning.md` | DR-D: BO warmup ~10% of budget; dim drives delay |
 | UC4 | Complete | `notebooks/uc4_confounder_sensitivity.ipynb` | `uc4_dag_reasoning.md` | DR-E/F/G: omission +135%, collider −41% (Berkson) |
+| UC5 | Complete | `notebooks/uc5_att_strategy_switching.ipynb` | `uc5_dag_reasoning.md` | DR-H: ATT = +0.073 > ATE = +0.069; switching loss concentrated in high-SNR campaigns |
+| UC6 | Complete | `notebooks/uc6_distribution_shift.ipynb` | `uc6_dag_reasoning.md` | DR-I/J/K/L: BO 1.35× more sensitive to noise shifts; static adjustment set overestimates BO advantage; monitor GP residual variance mid-campaign |
+
+---
+
+## UC6: Mid-Campaign Distribution Shift
+
+**Scientific question**: Does a mid-campaign noise increase causally degrade campaign outcome? Does the degradation depend on when the shift occurs and how large it is? Is BO more sensitive than random search?
+
+**New causal variables**:
+- `shift_time` — step at which noise increases, drawn from Uniform(0.2 × budget, 0.8 × budget)
+- `shift_magnitude` — noise multiplier, drawn from LogNormal with E[·] = 3.0×
+- `post_shift` — binary indicator: 1 if step > shift_time
+
+**Identification challenge**: The static backdoor adjustment set from UC2/UC3 `{budget, dim, ls, nl, snr}` is insufficient. Practitioners avoid BO when large shifts are expected (`shift_magnitude → strategy`, weight = −0.15), so BO campaigns face systematically smaller shifts. The static estimator therefore **overestimates** the BO advantage (bias = +0.009 in simulation). The correct adjustment set adds `shift_time` and `shift_magnitude`.
+
+**Estimator**: Interrupted Time Series (ITS) with DiD interpretation and cluster-robust standard errors (clustered by campaign). The outcome variable is `latent_outcome_t` (instantaneous step quality), which directly captures the structural shift effect. The key coefficient is `strategy:log_step:post_shift` (three-way interaction) — a negative value (−0.014, p = 0.047) confirms BO's convergence rate advantage shrinks post-shift. The `post_shift` main effect (level drop) is −0.064, p < 0.001, confirming an immediate quality drop at the shift point. The rate change is the robust signal for the BO-specific degradation.
+
+**Mechanism**: Post-shift, the effective SNR drops (median pre-shift SNR ≈ 8.24 → post-shift ≈ 2.93 with 3× noise increase), pushing many campaigns below the τ = 2.0 threshold and collapsing the BO advantage. BO's GP surrogate becomes miscalibrated; RS is unaffected because it does not use a surrogate model.
+
+**Design rules**:
+- **DR-UC6-A**: Earlier shifts and larger shifts cause more outcome degradation (both confirmed in simulation)
+- **DR-UC6-B**: BO is 1.35× more sensitive to noise shifts than RS (improvement rate drop: BO = 0.0123, RS = 0.0092)
+- **DR-UC6-C**: Static adjustment set is insufficient when noise is time-varying; always include shift parameters in the adjustment set
+- **DR-UC6-D**: Monitor GP residual variance mid-campaign to detect shifts; if post-shift SNR < τ = 2.0, consider switching to RS
 
 ---
 
@@ -66,14 +91,18 @@ sdl-causal/
 │   ├── uc1_backdoor_adjustment.ipynb
 │   ├── uc2_noise_moderation.ipynb
 │   ├── uc3_convergence_curves.ipynb
-│   └── uc4_confounder_sensitivity.ipynb
+│   ├── uc4_confounder_sensitivity.ipynb
+│   ├── uc5_att_strategy_switching.ipynb
+│   └── uc6_distribution_shift.ipynb
 ├── src/
-│   ├── simulator.py             # UC1–UC4 campaign simulator
-│   └── graphs.py                # DAG definitions (UC1–UC4)
+│   ├── simulator.py             # UC1–UC6 campaign simulator
+│   └── graphs.py                # DAG definitions (UC1–UC6)
 ├── tests/
 │   ├── test_uc2.py
 │   ├── test_uc3.py
-│   └── test_uc4.py              # 59 tests; full suite 235/235 pass
+│   ├── test_uc4.py
+│   ├── test_uc5.py
+│   └── test_uc6.py              # 55 tests (51 pass, 4 skipped — DoWhy not installed)
 └── uc*_dag_reasoning.md         # scientific reasoning per use case
 ```
 

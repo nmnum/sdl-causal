@@ -68,14 +68,18 @@ import pandas as pd
 # graphs.py is the single source of truth for edge weights.
 # Import the DAG and read weights from it rather than hardcoding them here.
 from src.graphs import (
-    uc1_dag, uc2_dag, uc3_dag, uc4_dag,
+    uc1_dag, uc2_dag, uc3_dag, uc4_dag, uc6_dag,
     get_adjustment_set, get_uc2_adjustment_set, get_uc3_adjustment_set,
     get_uc4_adjustment_sets, get_uc4_correct_adjustment_set,
+    get_uc6_adjustment_set, get_uc6_static_adjustment_set,
     UC1_NODE_META,
     UC2_SNR_THRESHOLD, UC2_SNR_SCALE, UC2_BO_FLOOR, UC2_BO_CEILING,
     UC3_ALPHA_RS, UC3_WARMUP_BASE, UC3_WARMUP_SCALE,
     UC3_WARMUP_W_DIM, UC3_WARMUP_W_SNR, UC3_WARMUP_W_IDQ, UC3_STEP_NOISE,
     UC4_COLLIDER_W_STRATEGY, UC4_COLLIDER_W_OUTCOME, UC4_COLLIDER_INTERCEPT,
+    UC6_SHIFT_TIME_W, UC6_SHIFT_MAG_W, UC6_POST_SHIFT_W,
+    UC6_SHIFT_MAG_SEL, UC6_SHIFT_MAG_MU, UC6_SHIFT_MAG_SIGMA,
+    UC6_SHIFT_TIME_LOW, UC6_SHIFT_TIME_HIGH,
 )
 
 
@@ -865,6 +869,345 @@ def run_campaigns_uc3(
     # Enforce column order and schema
     assert list(df.columns) == UC3_COLUMNS, (
         f"Column mismatch.\nExpected: {UC3_COLUMNS}\nGot: {list(df.columns)}"
+    )
+
+    return df
+
+
+# UC6_COLUMNS: one row per (campaign, step).
+# Extends UC3_COLUMNS with shift_time, shift_magnitude, post_shift,
+# and effective_snr_t (the time-varying SNR at each step).
+UC6_COLUMNS: list[str] = [
+    "campaign_id",            # int, campaign identifier
+    "step",                   # int, within-campaign evaluation index (1..budget)
+    "strategy",               # int, 0=random search, 1=BO (constant within campaign)
+    "norm_best_outcome_t",    # float in [0, 1], best found up to step t (clipped)
+    "latent_outcome_t",       # float, norm_best_outcome_t BEFORE clipping
+    "landscape_smoothness",   # float > 0, GP length-scale proxy
+    "budget",                 # int, total evaluations allowed
+    "noise_level",            # float >= 0, BASELINE (pre-shift) measurement noise std
+    "dimensionality",         # int in {3, 4, 6}
+    "initial_design_quality", # float in [0, 1]
+    "batch_id",               # int, batch identifier
+    "snr",                    # float > 0, BASELINE SNR = landscape_smoothness / noise_level
+    "snr_modulation",         # float, f(snr): campaign-level BO advantage (pre-shift ceiling)
+    "warmup_fraction",        # float in [0.05, 0.40]
+    "t_warmup",               # float, warmup_fraction × budget
+    "g_t",                    # float in [0, 1], warmup sigmoid at step t
+    "shift_time",             # float, step at which noise level increases
+    "shift_magnitude",        # float > 1, multiplicative noise increase factor
+    "post_shift",             # int {0, 1}, 1 if step > shift_time
+    "effective_snr_t",        # float > 0, effective SNR at step t
+                              #   = snr if step ≤ shift_time
+                              #   = snr / shift_magnitude if step > shift_time
+    "effective_snr_mod_t",    # float, f(effective_snr_t): actual BO advantage at step t
+    # ── Provenance ────────────────────────────────────────────────────────────
+    "p_bo",                   # float, P(strategy=BO) before Bernoulli draw
+    "batch_intercept",        # float, realised batch random effect
+]
+
+
+def run_campaigns_uc6(
+    n_campaigns: int = 500,
+    budget: int | tuple[int, int] = (20, 100),
+    n_batches: int = 10,
+    batch_sigma: float = 0.05,
+    outcome_noise_sigma: float = 0.03,
+    seed: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Generate a synthetic (campaign, step) panel encoding the UC6 causal DAG.
+
+    UC6 extends UC3 with a mid-campaign noise shift.  Each campaign has a
+    `shift_time` (when the noise increases) and a `shift_magnitude` (how much
+    it increases).  The BO advantage after the shift is modulated by the
+    post-shift SNR, not the pre-shift SNR.
+
+    Parameters
+    ----------
+    n_campaigns : int
+        Number of campaigns to simulate.
+
+    budget : int or (int, int)
+        If int, every campaign has this budget.
+        If (low, high), budget is drawn uniformly from [low, high].
+
+    n_batches : int
+        Number of distinct experimental batches.
+
+    batch_sigma : float
+        Standard deviation of the batch random intercept.
+
+    outcome_noise_sigma : float
+        Per-step residual noise std (within-campaign).
+
+    seed : int or None
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (campaign, step).  Columns defined in UC6_COLUMNS.
+        norm_best_outcome_t is clipped to [0, 1].
+        latent_outcome_t is the pre-clip value for causal estimation.
+
+    Notes
+    -----
+    Structural equation (per step t within campaign c):
+
+        effective_noise(t) = noise_level_c                          if t ≤ shift_time_c
+                           = noise_level_c × shift_magnitude_c      if t > shift_time_c
+
+        effective_snr(t)   = landscape_smoothness_c / effective_noise(t)
+
+        strategy_effect(t) = f(effective_snr(t)) × g(t; t_warmup_c) × strategy_c
+
+        latent_outcome_t = baseline(t)
+                         + strategy_effect(t)
+                         + [UC2 confounder terms]
+                         + UC6_SHIFT_TIME_W   × shift_time_std_c
+                         + UC6_SHIFT_MAG_W    × shift_magnitude_std_c
+                         + UC6_POST_SHIFT_W   × post_shift_t
+                         + batch_intercept_c
+                         + N(0, outcome_noise_sigma)
+
+    Distribution parameters:
+        shift_time      ~ Uniform(0.2 × budget, 0.8 × budget)
+        shift_magnitude ~ LogNormal(UC6_SHIFT_MAG_MU, UC6_SHIFT_MAG_SIGMA)
+                          so E[shift_magnitude] = 3.0 (noise triples on average)
+
+    Identification challenge:
+        The static UC2/UC3 adjustment set {budget, dim, ls, nl, snr} is
+        INSUFFICIENT for UC6.  The correct set adds shift_time and
+        shift_magnitude.  See uc6_dag_reasoning.md §5 and
+        get_uc6_adjustment_set() / get_uc6_static_adjustment_set().
+
+    Ground truth:
+        The true BO advantage at step t is:
+            f(effective_snr(t)) × g(t; t_warmup_c)
+        stored in the 'effective_snr_mod_t' column.
+        The pre-shift ceiling is stored in 'snr_modulation' (same as UC3).
+    """
+    rng = np.random.default_rng(seed)
+
+    # ── Validate DAG (imports constants; validates graph structure) ───────────
+    _ = uc6_dag()
+
+    # ── Step 1: Draw campaign-level confounders (same as UC3) ─────────────────
+    ls  = rng.lognormal(LS_MU, LS_SIGMA, n_campaigns)
+    nl  = rng.lognormal(NL_MU, NL_SIGMA, n_campaigns)
+    dim = rng.choice(DIM_VALUES, size=n_campaigns, p=DIM_PROBS).astype(float)
+
+    if isinstance(budget, tuple):
+        low, high = budget
+        bud = rng.integers(low, high + 1, size=n_campaigns).astype(float)
+    else:
+        bud = np.full(n_campaigns, float(budget))
+
+    idq          = rng.beta(IDQ_ALPHA, IDQ_BETA, n_campaigns)
+    batch_ids    = rng.integers(0, n_batches, size=n_campaigns)
+    batch_effects = rng.normal(0.0, batch_sigma, size=n_batches)
+    batch_intercept = batch_effects[batch_ids]
+
+    # ── Step 2: Draw UC6-specific campaign-level variables ────────────────────
+    # shift_time ~ Uniform(0.2 × budget, 0.8 × budget)
+    shift_time = rng.uniform(
+        UC6_SHIFT_TIME_LOW  * bud,
+        UC6_SHIFT_TIME_HIGH * bud,
+    )
+
+    # shift_magnitude ~ LogNormal(UC6_SHIFT_MAG_MU, UC6_SHIFT_MAG_SIGMA)
+    # E[shift_magnitude] = exp(mu + sigma²/2) = 3.0 by construction
+    shift_magnitude = rng.lognormal(UC6_SHIFT_MAG_MU, UC6_SHIFT_MAG_SIGMA, n_campaigns)
+    # Clip to [1.0, inf) — noise can only increase (or stay the same)
+    shift_magnitude = np.maximum(shift_magnitude, 1.0)
+
+    # ── Standardise continuous confounders ────────────────────────────────────
+    def _std(x: np.ndarray) -> np.ndarray:
+        s = x.std()
+        return (x - x.mean()) / s if s > 1e-12 else np.zeros_like(x)
+
+    ls_z   = _std(ls)
+    nl_z   = _std(nl)
+    dim_z  = _std(dim)
+    bud_z  = _std(bud)
+    idq_z  = _std(idq)
+
+    snr       = ls / np.maximum(nl, 1e-6)
+    log_snr   = np.log(np.maximum(snr, 1e-6))
+    log_snr_z = _std(log_snr)
+    snr_z     = _std(snr)
+
+    shift_time_z = _std(shift_time)
+    shift_mag_z  = _std(shift_magnitude)
+
+    # ── Step 3: Strategy assignment ───────────────────────────────────────────
+    # Extends UC3 selection model with shift_magnitude confounding.
+    G2 = uc2_dag()
+    w  = _read_edge_weights(G2)
+
+    logit_p = (
+        0.0
+        + w["landscape_smoothness__strategy"] * ls_z
+        + w["budget__strategy"]               * bud_z
+        + w["noise_level__strategy"]          * nl_z
+        + w["dimensionality__strategy"]       * dim_z
+        + w["snr__strategy"]                  * snr_z
+        + UC6_SHIFT_MAG_SEL                   * shift_mag_z   # new: large shifts reduce P(BO)
+    )
+    p_bo     = 1.0 / (1.0 + np.exp(-logit_p))
+    strategy = rng.binomial(1, p_bo).astype(float)
+
+    # ── Step 4: Campaign-level SNR modulation (pre-shift ceiling) ─────────────
+    snr_modulation = snr_modulation_fn(snr)   # f(snr): pre-shift BO advantage ceiling
+
+    # ── Step 5: Warmup fraction per campaign (same as UC3) ────────────────────
+    warmup_fraction = np.clip(
+        UC3_WARMUP_BASE
+        + UC3_WARMUP_W_DIM * dim_z
+        - UC3_WARMUP_W_SNR * log_snr_z
+        - UC3_WARMUP_W_IDQ * idq_z,
+        0.05, 0.40,
+    )
+    t_warmup = warmup_fraction * bud
+
+    # ── Step 6: Expand to (campaign, step) panel ──────────────────────────────
+    budgets_int = bud.astype(int)
+    total_rows  = budgets_int.sum()
+
+    camp_idx_arr = np.empty(total_rows, dtype=int)
+    step_arr     = np.empty(total_rows, dtype=int)
+
+    pos = 0
+    for c, b in enumerate(budgets_int):
+        camp_idx_arr[pos:pos + b] = c
+        step_arr[pos:pos + b]     = np.arange(1, b + 1)
+        pos += b
+
+    # Broadcast campaign-level quantities to step level
+    ls_panel          = ls[camp_idx_arr]
+    nl_panel          = nl[camp_idx_arr]
+    dim_panel         = dim[camp_idx_arr]
+    bud_panel         = bud[camp_idx_arr]
+    idq_panel         = idq[camp_idx_arr]
+    batch_id_panel    = batch_ids[camp_idx_arr]
+    batch_int_panel   = batch_intercept[camp_idx_arr]
+    snr_panel         = snr[camp_idx_arr]
+    snr_mod_panel     = snr_modulation[camp_idx_arr]
+    strategy_panel    = strategy[camp_idx_arr]
+    p_bo_panel        = p_bo[camp_idx_arr]
+    t_warmup_panel    = t_warmup[camp_idx_arr]
+    wf_panel          = warmup_fraction[camp_idx_arr]
+    shift_time_panel  = shift_time[camp_idx_arr]
+    shift_mag_panel   = shift_magnitude[camp_idx_arr]
+    shift_time_z_panel = shift_time_z[camp_idx_arr]
+    shift_mag_z_panel  = shift_mag_z[camp_idx_arr]
+
+    # Standardise panel-level confounders
+    ls_z_panel  = _std(ls_panel)
+    nl_z_panel  = _std(nl_panel)
+    dim_z_panel = _std(dim_panel)
+    bud_z_panel = _std(bud_panel)
+    idq_z_panel = _std(idq_panel)
+    snr_z_panel = _std(snr_panel)
+
+    # ── Step 7: Time-varying quantities ───────────────────────────────────────
+    t = step_arr.astype(float)
+
+    # post_shift indicator: 1 if step > shift_time
+    post_shift_panel = (t > shift_time_panel).astype(float)
+
+    # Effective SNR at each step
+    effective_noise_panel = np.where(
+        post_shift_panel == 1,
+        nl_panel * shift_mag_panel,   # post-shift: noise × shift_magnitude
+        nl_panel,                      # pre-shift: baseline noise
+    )
+    effective_snr_panel = ls_panel / np.maximum(effective_noise_panel, 1e-6)
+
+    # Effective SNR modulation at each step: f(effective_snr(t))
+    effective_snr_mod_panel = snr_modulation_fn(effective_snr_panel)
+
+    # Warmup sigmoid g(t; t_warmup)
+    g_t = 1.0 / (1.0 + np.exp(-(t - t_warmup_panel) / UC3_WARMUP_SCALE))
+
+    # ── Step 8: Structural equation ───────────────────────────────────────────
+    # Baseline: log-linear convergence (both strategies, same as UC3)
+    baseline = 0.40 + UC3_ALPHA_RS * np.log(t + 1.0)
+
+    # Time-varying strategy effect: uses EFFECTIVE SNR (not pre-shift SNR)
+    # This is the key UC6 mechanism: BO advantage collapses post-shift
+    strategy_effect = effective_snr_mod_panel * g_t * strategy_panel
+
+    # Confounder terms (same weights as UC2/UC3)
+    confounder_terms = (
+        w["landscape_smoothness__norm_best_outcome"]     * ls_z_panel
+        + w["budget__norm_best_outcome"]                 * bud_z_panel
+        + w["noise_level__norm_best_outcome"]            * nl_z_panel
+        + w["dimensionality__norm_best_outcome"]         * dim_z_panel
+        + w["initial_design_quality__norm_best_outcome"] * idq_z_panel
+        + w["snr__norm_best_outcome"]                    * snr_z_panel
+    )
+
+    # UC6-specific terms: shift confounders and post_shift indicator
+    shift_terms = (
+        UC6_SHIFT_TIME_W * shift_time_z_panel    # earlier shift → worse outcome
+        + UC6_SHIFT_MAG_W  * shift_mag_z_panel   # larger shift → worse outcome
+        + UC6_POST_SHIFT_W * post_shift_panel     # post-shift steps are harder
+    )
+
+    # Per-step noise
+    step_noise = rng.normal(0.0, outcome_noise_sigma, total_rows)
+
+    latent_t = (
+        baseline
+        + strategy_effect
+        + confounder_terms
+        + shift_terms
+        + batch_int_panel
+        + step_noise
+    )
+
+    # Clip to [0, 1] then take running maximum within each campaign
+    clipped_t = np.clip(latent_t, 0.0, 1.0)
+
+    best_t = np.empty(total_rows)
+    pos = 0
+    for b in budgets_int:
+        seg = clipped_t[pos:pos + b]
+        best_t[pos:pos + b] = np.maximum.accumulate(seg)
+        pos += b
+
+    # ── Assemble DataFrame ────────────────────────────────────────────────────
+    df = pd.DataFrame({
+        "campaign_id":            camp_idx_arr,
+        "step":                   step_arr,
+        "strategy":               strategy_panel.astype(int),
+        "norm_best_outcome_t":    best_t,
+        "latent_outcome_t":       latent_t,
+        "landscape_smoothness":   ls_panel,
+        "budget":                 bud_panel.astype(int),
+        "noise_level":            nl_panel,
+        "dimensionality":         dim_panel.astype(int),
+        "initial_design_quality": idq_panel,
+        "batch_id":               batch_id_panel,
+        "snr":                    snr_panel,
+        "snr_modulation":         snr_mod_panel,
+        "warmup_fraction":        wf_panel,
+        "t_warmup":               t_warmup_panel,
+        "g_t":                    g_t,
+        "shift_time":             shift_time_panel,
+        "shift_magnitude":        shift_mag_panel,
+        "post_shift":             post_shift_panel.astype(int),
+        "effective_snr_t":        effective_snr_panel,
+        "effective_snr_mod_t":    effective_snr_mod_panel,
+        "p_bo":                   p_bo_panel,
+        "batch_intercept":        batch_int_panel,
+    })
+
+    # Enforce column order and schema
+    assert list(df.columns) == UC6_COLUMNS, (
+        f"Column mismatch.\nExpected: {UC6_COLUMNS}\nGot: {list(df.columns)}"
     )
 
     return df
