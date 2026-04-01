@@ -1,0 +1,67 @@
+[
+  {
+    "rule_id": "DR-H-subgroup",
+    "source_uc": "UC9",
+    "statement": "CATE analysis (n=1000, CausalForestDML, RBF-surrogate BO): global CATE=+0.2210 [0.1708, 0.2711]; 100% of campaigns have positive CATE. Subgroups: high_snr_long_budget (n=286): ATE=+0.1893 [0.147, 0.231]\nhigh_snr_short_budget (n=214): ATE=+0.1933 [0.154, 0.233]\nlow_snr_long_budget (n=294): ATE=+0.2603 [0.200, 0.321]\nlow_snr_short_budget (n=206): ATE=+0.2377 [0.180, 0.295].",
+    "effect_size": 0.220963,
+    "effect_label": "Global CATE (CausalForestDML mean)",
+    "ci_lo": 0.170779,
+    "ci_hi": 0.271147,
+    "snr_threshold": null,
+    "budget_threshold": null,
+    "subgroup_ates": {
+      "high_snr_long_budget": {
+        "n": 286,
+        "ate": 0.1892562975072111,
+        "ci_lo": 0.14704345859055304,
+        "ci_hi": 0.2314691364238691
+      },
+      "high_snr_short_budget": {
+        "n": 214,
+        "ate": 0.19328029016948542,
+        "ci_lo": 0.1535421561085156,
+        "ci_hi": 0.23301842423045516
+      },
+      "low_snr_long_budget": {
+        "n": 294,
+        "ate": 0.26025376619462004,
+        "ci_lo": 0.19994159567972483,
+        "ci_hi": 0.3205659367095154
+      },
+      "low_snr_short_budget": {
+        "n": 206,
+        "ate": 0.23766621455697529,
+        "ci_lo": 0.18001962008269773,
+        "ci_hi": 0.29531280903125284
+      }
+    },
+    "validity_range": "Budget 30\u201350; SNR 1.67\u201319.03; n=1000 campaigns",
+    "caveats": [
+      "CausalForestDML uses GBM nuisance models \u2014 may overfit with small n.",
+      "n_dims is constant within this simulation; its importance is not identifiable.",
+      "Subgroup CIs are averaged pointwise \u2014 not joint CIs.",
+      "Honest splitting reduces bias but increases variance with small n.",
+      "All data is synthetic (RBF-surrogate simulation) \u2014 validate thresholds on real experimental data before deployment."
+    ],
+    "data_sufficient": true
+  },
+  {
+    "rule_id": "DR-H-varimp",
+    "source_uc": "UC9",
+    "statement": "Variable importance for CATE moderation: snr=0.8206, budget=0.1794, n_dims=0.0000. Top moderator: 'snr'.",
+    "effect_size": 0.820588,
+    "effect_label": "Max variable importance (snr)",
+    "varimp": {
+      "budget": 0.179412,
+      "snr": 0.820588,
+      "n_dims": 0.0
+    },
+    "top_moderator": "snr",
+    "caveats": [
+      "Variable importance from causal forest splitting \u2014 not a formal test.",
+      "Correlated covariates split importance arbitrarily.",
+      "n_dims constant within dataset \u2192 importance unreliable."
+    ],
+    "data_sufficient": true
+  }
+]
