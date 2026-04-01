@@ -47,6 +47,7 @@ dependencies:
 
     - scipy>=1.10
     - statsmodels>=0.14
+    - ruptures
 
     # ── Visualisation ─────────────────────────────────────────────────────────
     - matplotlib>=3.7
